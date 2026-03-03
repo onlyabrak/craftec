@@ -76,6 +76,7 @@ bloomfilter = "1"
 
 # Testing
 tempfile = "3"
+wat = "1"
 
 [profile.release]
 lto = "thin"
