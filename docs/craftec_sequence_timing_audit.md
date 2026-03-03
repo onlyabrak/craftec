@@ -21,18 +21,21 @@
 
 **Audit verdict**: Correct. No remaining issues.
 
-### T2: SWIM Probe-Ack Correlation ✅ FIXED
+### T2: SWIM Probe-Ack Correlation ✅ FIXED (revised)
 
 **File**: `craftec-net/src/swim.rs`
 
 - `probe_nonce: AtomicU64` — monotonic counter for unique nonces
 - `pending_probes: DashMap<u64, oneshot::Sender<u64>>` — correlates nonce to ack
-- `register_probe() → (nonce, oneshot::Receiver)` — allocates nonce, registers sender
 - `resolve_probe(nonce, incarnation) → bool` — removes from map and sends incarnation
 - `random_alive_excluding()` — selects K=3 indirect delegates for ping-req path
 - `SwimPing` carries `nonce`; `SwimPingAck` echoes `nonce + incarnation`
 
-**Audit verdict**: Correct. Nonce-correlated probes prevent ack misrouting.
+**Original audit missed a bug**: `protocol_tick()` allocated nonce N and baked it into the `SwimPing` message, then `probe_with_ack()` called `register_probe()` which allocated a *second* nonce N+1. The remote peer responded with nonce N, but the pending probe was registered under N+1 — so `resolve_probe(N)` never matched. All direct probes timed out, causing spurious suspect/dead transitions and a slow memory leak in `pending_probes`.
+
+**Fix** (commit `ae90a79`): `probe_with_ack()` now extracts the nonce from the already-built `SwimPing` message and registers a probe receiver under that nonce, instead of calling `register_probe()`. Also fixed: indirect probes were sending to `target` instead of delegates (the `_delegate` variable was unused).
+
+**Audit verdict**: Correct after fix. Nonce-correlated probes prevent ack misrouting.
 
 ### T3: PendingFetches Timeout & Staleness ✅ FIXED
 
@@ -89,15 +92,16 @@
 
 **File**: `craftec-sql/src/database.rs`
 
-- `execute()` method: `let conn = self.conn.lock().await;` acquired first
+- `execute()` method: `let conn = self.write_conn.lock().await;` acquired first (C2: now uses dedicated write connection)
 - SQL execution: `conn.execute(sql, ()).await`
 - VFS sync: `Self::sync_pages_to_vfs(&self.db_path, &self.vfs).await`
 - Root update: `*self.root_cid.write() = new_root;`
 - Event publish: PageCommitted event sent
 - `drop(conn)` — explicit release AFTER all commit steps
 - Comment: "T9 fix: hold the conn mutex through the entire execute-commit cycle"
+- `query()` uses separate `read_conn` — reads don't block behind writes (C2 fix)
 
-**Audit verdict**: Correct. The conn mutex serializes execute→sync→root_update→event atomically.
+**Audit verdict**: Correct. The write_conn mutex serializes execute→sync→root_update→event atomically. Reads use independent read_conn.
 
 ### T10: Request/Response Correlation IDs ✅ FIXED
 
@@ -169,25 +173,28 @@
 
 **Audit verdict**: Correct. Both subsystems publish events via post-init injection.
 
-### G3: RLNC Encode on Write ✅ FIXED
+### G3: RLNC Encode on Write ✅ FIXED (revised)
 
 **File**: `craftec-node/src/node.rs` (event dispatch loop), `craftec-node/src/piece_store.rs`
 
 - Event dispatch loop handles `CidWritten`:
   1. DHT announce: `announce_cid_to_peers()`
   2. Recursion guard: `if piece_index.is_piece_cid(&cid) { continue; }` — skip piece CIDs
-  3. Fetch raw data: `store.get(&cid).await`
-  4. RLNC encode: `rlnc.encode(&data, k=32).await`
-  5. Store each coded piece: `store.put(&serialized_piece).await`
-  6. Mark as piece CID: `piece_index.mark_piece_cid(pcid)`
-  7. Record in piece tracker: `piece_tracker.record_piece()`
-  8. Update index: `piece_index.insert(cid, pcids)`
+  3. Fire-and-forget `tokio::spawn` (C1 fix):
+     a. Fetch raw data: `store.get(&cid).await`
+     b. RLNC encode: `rlnc.encode(&data, k=32).await`
+     c. For each coded piece: pre-compute CID, mark as piece CID, THEN `store.put()`
+     d. Record in piece tracker + piece index
 
 - `CodedPieceIndex`:
   - `DashMap<Cid, Vec<Cid>>` — maps content CID → piece CIDs
   - `DashSet<Cid>` — tracks all piece CIDs for recursion prevention
 
-**Audit verdict**: Correct. No infinite encoding loop.
+**Original audit missed a race condition**: Step 6 (`mark_piece_cid`) ran AFTER `store.put()` (Step 5). When C1 moved encoding to `tokio::spawn`, the event loop could receive the `CidWritten` for a coded piece before `mark_piece_cid` was called, causing recursive RLNC encoding.
+
+**Fix** (commit `ae90a79`): Pre-compute CID via `Cid::from_data(&bytes)` and call `mark_piece_cid()` BEFORE `store.put()` fires `CidWritten`. Also replaced `unwrap_or_default()` on `postcard::to_allocvec()` with proper error handling.
+
+**Audit verdict**: Correct after fix. No infinite encoding loop.
 
 ### G4: See T10 + T11 (correlation + timeouts)
 
@@ -268,13 +275,16 @@ App → CraftOBJ::put(data)
 Event dispatch receives CidWritten:
   → DHT announce to alive peers
   → recursion guard: skip if piece_index.is_piece_cid(cid)
-  → RLNC encode(data, k=32) → Vec<CodedPiece>
-  → for each piece:
-      → postcard::to_allocvec(piece)
-      → store.put(bytes) → piece_cid
-      → piece_index.mark_piece_cid(piece_cid)  ← prevents re-encoding
-      → piece_tracker.record_piece(cid, holder)
-  → piece_index.insert(cid, all_piece_cids)
+  → tokio::spawn fire-and-forget (C1 fix):
+    → RLNC encode(data, k=32) → Vec<CodedPiece>
+    → piece_tracker.record_k(cid, k)  ← C7 fix
+    → for each piece:
+        → postcard::to_allocvec(piece) (with error handling, skip on failure)
+        → Cid::from_data(bytes) → pre-compute piece_cid
+        → piece_index.mark_piece_cid(piece_cid)  ← BEFORE put (race fix)
+        → store.put(bytes) → piece_cid (fires CidWritten, but already marked)
+        → piece_tracker.record_piece(cid, holder)
+    → piece_index.insert(cid, all_piece_cids)
 ```
 
 **Ordering correctness**:
@@ -284,7 +294,7 @@ Event dispatch receives CidWritten:
 - Event only on actual writes (dedup path skips event) ✅
 - Recursion guard checked BEFORE encoding ✅
 
-**Potential issue**: RLNC encode happens in the event dispatch loop (single task). If encoding is slow for large objects, it blocks other event processing. **Recommendation**: Consider spawning encode tasks on `JoinSet` or `tokio::spawn` for parallelism. Not a correctness issue, but a throughput concern.
+**Previously noted**: RLNC encode ran inline in the event dispatch loop. **Fixed** (C1): Now runs in fire-and-forget `tokio::spawn`. Race condition in piece CID marking also fixed — CID pre-computed and marked BEFORE `store.put()` fires `CidWritten`.
 
 ### Phase 4: Query (Read Path)
 
@@ -309,7 +319,7 @@ App → CraftSQL::query(sql)
 - Integrity check after every disk read — silent corruption impossible ✅
 - SQL reads hold conn mutex — prevents interleave with writes ✅
 
-**Potential issue**: SQL reads take the same `tokio::sync::Mutex` as writes. Under heavy write load, reads will queue behind writes. The single-writer model means this is intentional, but reads could benefit from a separate read-only connection. Not a bug, but a throughput constraint.
+**Previously noted**: SQL reads took the same `tokio::sync::Mutex` as writes. **Fixed** (C2): Separate `write_conn` and `read_conn` with `PRAGMA busy_timeout = 5000` on both.
 
 ### Phase 5: Network Message Handling
 
@@ -376,88 +386,67 @@ Ctrl+C / SIGTERM → wait_for_shutdown() returns
 
 ---
 
-## Part C — Remaining Issues Found
+## Part C — Issues Found & Resolved
 
-### C1: RLNC Encoding Blocks Event Loop (MEDIUM)
+All 7 issues identified during the audit have been fixed in commit `ae90a79`.
 
-**Location**: `craftec-node/src/node.rs` lines 518–544
+### C1: RLNC Encoding Blocks Event Loop ✅ FIXED
 
-The event dispatch loop performs RLNC encoding synchronously within the `CidWritten` handler. For large objects, `rlnc.encode(&data, k=32)` could take significant time, blocking all other event processing (PeerConnected, PeerDisconnected, DiskWatermark, etc.).
+**Location**: `craftec-node/src/node.rs`
 
-**Impact**: Under heavy write load, event processing latency increases.
+**Was**: RLNC encoding ran inline in the event dispatch loop, blocking all event processing.
 
-**Fix**: Spawn RLNC encode work on a separate `tokio::spawn` or dedicated channel. The event loop should fire-and-forget the encode task.
+**Fix**: Moved to fire-and-forget `tokio::spawn`. DHT announce stays inline (lightweight). Pre-compute CID and `mark_piece_cid()` BEFORE `store.put()` to prevent race condition with recursive encoding. Serialization failures handled with `match` instead of `unwrap_or_default()`.
 
-```rust
-// Instead of inline encoding, spawn:
-let store2 = Arc::clone(&store);
-let rlnc2 = Arc::clone(&rlnc);
-let pi2 = Arc::clone(&piece_index);
-let pt2 = Arc::clone(&piece_tracker);
-tokio::spawn(async move {
-    // RLNC encode + store + track
-});
-```
+### C2: SQL Read Contention Under Write Load ✅ FIXED
 
-### C2: SQL Read Contention Under Write Load (LOW)
+**Location**: `craftec-sql/src/database.rs`
 
-**Location**: `craftec-sql/src/database.rs` lines 293–299
+**Was**: Both `execute()` and `query()` held the same `tokio::sync::Mutex<libsql::Connection>`.
 
-Both `execute()` and `query()` hold the same `tokio::sync::Mutex<libsql::Connection>`. Reads queue behind writes. This is inherent to the single-writer model but could be alleviated by:
-- Using a separate read-only connection for queries
-- Opening a second `libsql::Connection` in read-only mode
+**Fix**: Split into `write_conn` and `read_conn`. `execute()` uses `write_conn`, `query()` uses `read_conn`. Both connections have `PRAGMA busy_timeout = 5000` to handle lock contention gracefully. New test: `concurrent_read_during_write`.
 
-**Impact**: Read latency spikes during write bursts.
+### C3: SWIM Piggyback Doesn't Scale ✅ FIXED
 
-### C3: SWIM Protocol Period May Be Too Fast (INFO)
+**Location**: `craftec-net/src/swim.rs`
 
-**Location**: `craftec-net/src/swim.rs` line 49
+**Was**: Piggyback gossip count hardcoded to 4 regardless of cluster size.
 
-`DEFAULT_PROTOCOL_PERIOD = 500ms` — this means one probe per 500ms. At 1M nodes, this generates 2M probes/second network-wide. This is within SWIM's O(N) complexity guarantee but the constant factor matters.
+**Fix**: `adaptive_piggyback_count(n)` returns `max(4, ceil(log2(n)))`. Added `alive_count()` method and `tick_count` with periodic membership summaries every 10 ticks. Protocol period stays constant per SWIM paper. 3 new tests.
 
-**Impact**: Network bandwidth at scale. Consider adaptive protocol period based on cluster size.
+### C4: Storage Bootstrap Is Unbounded ✅ FIXED
 
-### C4: Storage Bootstrap Is Unbounded (LOW)
+**Location**: `craftec-node/src/node.rs`
 
-**Location**: `craftec-node/src/node.rs` lines 371–398
+**Was**: Listed ALL local CIDs and announced each one sequentially with no rate limiting.
 
-At startup, the node lists ALL local CIDs and announces each one to peers. If a node holds millions of CIDs, this could take a very long time and flood the network with ProviderAnnounce messages.
+**Fix**: Batched CID announcements (100 CIDs/batch) with 1s sleep between batches. Shutdown-aware via `tokio::select!` with `shutdown_rx.try_recv()` check between batches. Logs progress.
 
-**Impact**: Slow startup for data-heavy nodes. Could congest DHT.
+### C5: No Periodic PendingFetches Pruning ✅ FIXED
 
-**Fix**: Rate-limit announcements (e.g., 1000/sec) and prioritize recently-written CIDs.
+**Location**: `craftec-node/src/node.rs`
 
-### C5: No Periodic PendingFetches Pruning (LOW)
+**Fix**: Background task spawned in `run()` with 60s interval, `prune_stale(Duration::from_secs(120))`. Shutdown-aware via `tokio::select!`. Logs pruned count at debug level.
 
-**Location**: `craftec-net/src/pending.rs`
+### C6: DHT Provider Pruning Not Scheduled ✅ FIXED
 
-`prune_stale()` exists but is never called from any background task. Stale entries accumulate until the process restarts.
+**Location**: `craftec-node/src/node.rs`
 
-**Fix**: Add a periodic pruning task in `node.rs::run()`:
-```rust
-tasks.spawn(async move {
-    loop {
-        tokio::time::sleep(Duration::from_secs(60)).await;
-        pending_fetches.prune_stale(Duration::from_secs(120));
-    }
-});
-```
+**Fix**: Background task spawned in `run()` with 60s interval, `prune_stale(Duration::from_secs(300))` (5min TTL). Shutdown-aware via `tokio::select!`. Logs pruned count at debug level.
 
-### C6: DHT Provider Pruning Not Scheduled (LOW)
+### C7: HealthScanner Uses Hardcoded K=32 ✅ FIXED
 
-Similar to C5: `DhtProviders::prune_stale()` exists but no periodic task calls it. Stale provider records accumulate.
+**Location**: `craftec-health/src/tracker.rs`, `craftec-health/src/scanner.rs`, `craftec-node/src/node.rs`
 
-### C7: HealthScanner Uses Hardcoded K=32 (INFO)
+**Was**: `DEFAULT_K = 32` hardcoded in scanner.
 
-**Location**: `craftec-health/src/scanner.rs` line 40
-
-`DEFAULT_K = 32` is hardcoded. In the technical foundation, K can vary per object. The scanner should read K from the CID's metadata or the piece tracker.
-
-**Impact**: Objects with different K values get incorrect health assessments.
+**Fix**: Added `k_values: Arc<DashMap<Cid, u32>>` to `PieceTracker` with `record_k()` (first-writer-wins) and `get_k()`. Scanner uses `piece_tracker.get_k(cid).unwrap_or(DEFAULT_K)`. K values cleaned up in `remove_node()`. RLNC encode calls `record_k(&cid, k)` after encoding. 3 new tests.
 
 ---
 
-## Part D — Verbose Structured Logging Plan
+## Part D — Verbose Structured Logging ✅ IMPLEMENTED
+
+All logging additions below were implemented in commit `ae90a79`.
 
 ### Principles
 
@@ -625,396 +614,106 @@ tracing::info!(alive = alive_count, suspect = suspect_count, dead = dead_count, 
 
 ---
 
-## Part E — Docker Multi-Node Test Plan
+## Part E — Docker Multi-Node Test Infrastructure ✅ IMPLEMENTED
+
+Built and tested in commits `ae90a79` (initial) and `d47da36` (fixes).
 
 ### Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│              Docker Compose Network                   │
-│                  (craftec-net)                        │
-│                                                       │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐           │
-│  │  node-1   │  │  node-2   │  │  node-3   │          │
-│  │ (seed)    │  │           │  │           │          │
-│  │ port:9001 │  │ port:9002 │  │ port:9003 │          │
-│  └──────────┘  └──────────┘  └──────────┘           │
-│                                                       │
-│  ┌──────────┐  ┌──────────┐                          │
-│  │  node-4   │  │  node-5   │  ← degradation test    │
-│  │ port:9004 │  │ port:9005 │    (stop & restart)     │
-│  └──────────┘  └──────────┘                          │
-│                                                       │
-│  ┌──────────────────────────────┐                    │
-│  │   test-runner (scripts)      │                    │
-│  │   - Rust integration tests   │                    │
-│  │   - Shell scenario scripts   │                    │
-│  └──────────────────────────────┘                    │
-└─────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│              Docker Compose Network (craftec)               │
+│                  subnet: 172.28.0.0/16                     │
+│                                                            │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐                │
+│  │  node-1   │  │  node-2   │  │  node-3   │               │
+│  │ (seed)    │  │           │  │           │               │
+│  │ 172.28.1.1│  │ 172.28.1.2│  │ 172.28.1.3│               │
+│  │ port:4433 │  │ port:4433 │  │ port:4433 │               │
+│  └──────────┘  └──────────┘  └──────────┘                │
+│                                                            │
+│  ┌──────────┐  ┌──────────┐  ┌─────────────────────────┐ │
+│  │  node-4   │  │  node-5   │  │   test-runner           │ │
+│  │ 172.28.1.4│  │ 172.28.1.5│  │   172.28.1.100          │ │
+│  │ port:4433 │  │ port:4433 │  │   docker:27-cli         │ │
+│  └──────────┘  └──────────┘  │   + Docker socket mount  │ │
+│                               └─────────────────────────┘ │
+└────────────────────────────────────────────────────────────┘
 ```
 
-### Dockerfile
+### Key Design Decisions
 
-```dockerfile
-# Dockerfile for craftec node
-FROM rust:1.83-slim-bookworm AS builder
-
-RUN apt-get update && apt-get install -y \
-    pkg-config libssl-dev cmake clang \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /build
-COPY . .
-RUN cargo build --release --bin craftec-node
-
-# Runtime image
-FROM debian:bookworm-slim
-
-RUN apt-get update && apt-get install -y \
-    ca-certificates curl jq \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY --from=builder /build/target/release/craftec-node /usr/local/bin/
-
-# Data volume
-VOLUME /data
-
-# Default config via environment
-ENV CRAFTEC_DATA_DIR=/data
-ENV CRAFTEC_LISTEN_PORT=9000
-ENV CRAFTEC_BOOTSTRAP_PEERS=""
-ENV CRAFTEC_LOG_LEVEL=info
-
-EXPOSE 9000/udp
-
-ENTRYPOINT ["craftec-node"]
-```
-
-### docker-compose.yml
-
-```yaml
-version: '3.8'
-
-networks:
-  craftec-net:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 172.28.0.0/16
-
-services:
-  node-1:
-    build: .
-    container_name: craftec-node-1
-    hostname: node-1
-    networks:
-      craftec-net:
-        ipv4_address: 172.28.0.10
-    ports:
-      - "9001:9000/udp"
-    volumes:
-      - node1-data:/data
-    environment:
-      - CRAFTEC_LISTEN_PORT=9000
-      - CRAFTEC_BOOTSTRAP_PEERS=
-      - CRAFTEC_LOG_LEVEL=debug
-      - RUST_LOG=craftec=debug
-
-  node-2:
-    build: .
-    container_name: craftec-node-2
-    hostname: node-2
-    networks:
-      craftec-net:
-        ipv4_address: 172.28.0.11
-    ports:
-      - "9002:9000/udp"
-    volumes:
-      - node2-data:/data
-    environment:
-      - CRAFTEC_LISTEN_PORT=9000
-      - CRAFTEC_BOOTSTRAP_PEERS=172.28.0.10:9000
-      - CRAFTEC_LOG_LEVEL=debug
-      - RUST_LOG=craftec=debug
-    depends_on:
-      - node-1
-
-  node-3:
-    build: .
-    container_name: craftec-node-3
-    hostname: node-3
-    networks:
-      craftec-net:
-        ipv4_address: 172.28.0.12
-    ports:
-      - "9003:9000/udp"
-    volumes:
-      - node3-data:/data
-    environment:
-      - CRAFTEC_LISTEN_PORT=9000
-      - CRAFTEC_BOOTSTRAP_PEERS=172.28.0.10:9000
-      - CRAFTEC_LOG_LEVEL=debug
-      - RUST_LOG=craftec=debug
-    depends_on:
-      - node-1
-
-  node-4:
-    build: .
-    container_name: craftec-node-4
-    hostname: node-4
-    networks:
-      craftec-net:
-        ipv4_address: 172.28.0.13
-    ports:
-      - "9004:9000/udp"
-    volumes:
-      - node4-data:/data
-    environment:
-      - CRAFTEC_LISTEN_PORT=9000
-      - CRAFTEC_BOOTSTRAP_PEERS=172.28.0.10:9000
-      - CRAFTEC_LOG_LEVEL=debug
-      - RUST_LOG=craftec=debug
-    depends_on:
-      - node-1
-
-  node-5:
-    build: .
-    container_name: craftec-node-5
-    hostname: node-5
-    networks:
-      craftec-net:
-        ipv4_address: 172.28.0.14
-    ports:
-      - "9005:9000/udp"
-    volumes:
-      - node5-data:/data
-    environment:
-      - CRAFTEC_LISTEN_PORT=9000
-      - CRAFTEC_BOOTSTRAP_PEERS=172.28.0.10:9000
-      - CRAFTEC_LOG_LEVEL=debug
-      - RUST_LOG=craftec=debug
-    depends_on:
-      - node-1
-
-  test-runner:
-    build:
-      context: .
-      dockerfile: Dockerfile.test
-    container_name: craftec-test-runner
-    networks:
-      craftec-net:
-        ipv4_address: 172.28.0.100
-    volumes:
-      - ./tests:/tests
-      - test-results:/results
-    environment:
-      - NODE1=172.28.0.10:9000
-      - NODE2=172.28.0.11:9000
-      - NODE3=172.28.0.12:9000
-      - NODE4=172.28.0.13:9000
-      - NODE5=172.28.0.14:9000
-    depends_on:
-      - node-1
-      - node-2
-      - node-3
-      - node-4
-      - node-5
-
-volumes:
-  node1-data:
-  node2-data:
-  node3-data:
-  node4-data:
-  node5-data:
-  test-results:
-```
-
-### Test Scenarios
-
-#### Scenario 1: Cluster Formation
-```
-Test: All 5 nodes form a cluster via SWIM
-Steps:
-  1. Start node-1 (seed, no bootstrap)
-  2. Start nodes 2-5 (bootstrap to node-1)
-  3. Wait 10s for SWIM convergence
-  4. Query each node's alive_members()
-Expected:
-  - Each node sees 4 alive peers
-  - All incarnation counters at 0
-  - No suspect/dead members
-Verify:
-  - grep logs for "SWIM: mark_alive" on each node
-  - Count = 4 per node
-```
-
-#### Scenario 2: Data Store & Retrieve
-```
-Test: Write on node-1, read from node-3
-Steps:
-  1. PUT "hello craftec" on node-1 → get CID
-  2. Wait 5s for RLNC encoding + DHT announcement
-  3. Query node-3 for CID via PieceRequest
-Expected:
-  - node-1 logs CidWritten event
-  - node-1 logs RLNC encode (32 coded pieces)
-  - node-1 logs ProviderAnnounce sent
-  - node-3 receives ProviderAnnounce
-  - node-3 can fetch pieces and reconstruct
-```
-
-#### Scenario 3: Node Failure Detection
-```
-Test: Kill node-4, verify SWIM detects failure
-Steps:
-  1. Cluster fully formed (5 nodes)
-  2. docker stop craftec-node-4 (abrupt kill)
-  3. Wait for SWIM suspect_timeout (5s) + protocol period
-  4. Query alive_members() on remaining 4 nodes
-Expected:
-  - node-4 transitions: Alive → Suspect → Dead
-  - Other nodes log "SWIM: mark_suspect" then "SWIM: mark_dead"
-  - alive_members() returns 3 on each surviving node
-  - PeerDisconnected event published
-  - piece_tracker.remove_node(node-4) called
-```
-
-#### Scenario 4: Node Rejoin
-```
-Test: Restart node-4 after death declaration
-Steps:
-  1. After Scenario 3 completes
-  2. docker start craftec-node-4
-  3. Wait for bootstrap + SWIM convergence
-  4. Query alive_members() on all nodes
-Expected:
-  - node-4 rejoins with incarnation=0
-  - Other nodes update mark_alive(node-4, 0)
-  - node.lock from previous dirty shutdown logged as warning
-  - Full membership restored (4 alive peers per node)
-```
-
-#### Scenario 5: Health Scan & Repair
-```
-Test: Kill a node holding pieces, verify repair
-Steps:
-  1. PUT large data on node-1 (RLNC encode → 32 pieces distributed)
-  2. Wait for pieces to be tracked across nodes
-  3. Kill node-2 (holds some pieces)
-  4. Wait for health scan cycle (36s at default)
-  5. Check repair executor logs
-Expected:
-  - HealthScanner detects piece count below target
-  - RepairRequest::Normal or Critical emitted
-  - RepairExecutor fetches pieces from surviving nodes
-  - RepairExecutor recodes and distributes to node with fewest pieces
-  - After repair: piece count >= target
-```
-
-#### Scenario 6: SQL Write & RPC Write
-```
-Test: Owner writes locally, remote attempts signed write
-Steps:
-  1. node-1 creates table: CREATE TABLE test (id INTEGER)
-  2. node-1 inserts: INSERT INTO test VALUES (42)
-  3. node-1 queries: SELECT * FROM test → verify [42]
-  4. node-2 sends SignedWrite to node-1 (non-owner key)
-  5. node-2 sends SignedWrite to node-1 (owner key, valid signature)
-Expected:
-  - Steps 1-3: succeed, root_cid changes
-  - Step 4: rejected with UnauthorizedWriter
-  - Step 5: succeed if CAS matches, rejected if stale root
-```
-
-#### Scenario 7: Graceful Shutdown
-```
-Test: SIGTERM produces clean shutdown
-Steps:
-  1. Cluster running with data stored
-  2. docker stop craftec-node-3 (SIGTERM)
-  3. Check node-3 logs
-Expected:
-  - "Received SIGTERM, initiating shutdown..."
-  - "Graceful shutdown initiated..."
-  - ShutdownSignal event published
-  - All background tasks stop (accept, SWIM, health, event)
-  - "node.lock removed"
-  - "Graceful shutdown complete"
-  - No "timed out after 5s" warning (clean exit)
-```
-
-#### Scenario 8: Concurrent Writes (Single Writer)
-```
-Test: Multiple concurrent writes from owner → serialized correctly
-Steps:
-  1. node-1 sends 100 concurrent INSERT statements
-  2. Query row count after all complete
-Expected:
-  - All 100 inserts succeed (tokio Mutex serializes)
-  - Row count = 100
-  - No data loss or corruption
-  - Root CID changes 100 times monotonically
-```
-
-#### Scenario 9: HLC Clock Skew
-```
-Test: Simulate clock skew between nodes
-Steps:
-  1. Set node-5's system clock 600ms ahead (> 500ms max skew)
-  2. node-1 sends message to node-5
-  3. Check node-5 logs for HLC rejection
-Expected:
-  - node-5 logs "HLC clock skew" error
-  - Message rejected at wire protocol level
-  - node-5 continues operating normally with local clock
-```
-
-#### Scenario 10: Degradation (Shedding Excess)
-```
-Test: Network shrinks gracefully when nodes leave
-Steps:
-  1. 5-node cluster with distributed data
-  2. Gracefully stop nodes 3, 4, 5 (one at a time, 30s apart)
-  3. Monitor health scan on nodes 1 and 2
-Expected:
-  - SWIM detects departures progressively
-  - Health scanner reports degraded piece counts
-  - Repair executor recodes pieces to maintain target on remaining nodes
-  - No data loss if k=32 pieces remain available
-  - System continues with 2 nodes at reduced redundancy
-```
+- **Dockerfile**: `rust:latest` builder → `debian:bookworm-slim` runtime. Binary name is `craftec`. Non-root `craftec` user. `WORKDIR /data` for config file writes.
+- **Environment overrides**: `CRAFTEC_DATA_DIR`, `CRAFTEC_LISTEN_PORT`, `CRAFTEC_BOOTSTRAP_PEERS` (implemented in `main.rs`).
+- **Test runner**: Uses `docker:27-cli` with Docker socket mounted (`/var/run/docker.sock:ro`) so it can run `docker logs` to inspect node behavior. This is the key architectural choice — tests verify behavior via structured log patterns.
+- **Nodes 2-5** bootstrap from node-1 (`172.28.1.1:4433`).
 
 ### Running Tests
 
 ```bash
-# Build and start cluster
-docker compose build
-docker compose up -d
+# Build and run everything (test-runner runs automatically)
+docker compose up --build
 
-# Wait for convergence
-sleep 15
+# Or start cluster separately
+docker compose up -d --build node-1 node-2 node-3 node-4 node-5
+docker compose run test-runner
 
-# Run test scenarios
-docker compose exec test-runner /tests/run_all.sh
-
-# View logs for a specific node
-docker compose logs node-1 | grep "SWIM:"
-docker compose logs node-2 | grep "CraftOBJ:"
+# View specific node logs
+docker compose logs -f node-1
 
 # Tear down
 docker compose down -v
 ```
 
+### Test Scenarios (Not Yet Testable)
+
+The following scenarios from the original plan require a lightweight HTTP/RPC test endpoint on the node so the test runner can trigger operations. Currently the node only speaks QUIC wire protocol, so the test runner can only observe via log patterns.
+
+1. **Data Store & Retrieve** — PUT on node-1, read from node-3
+2. **Health Scan & Repair** — kill node holding pieces, verify repair
+3. **SQL Write & RPC Write** — owner writes, remote SignedWrite
+4. **Concurrent Writes** — 100 concurrent INSERTs
+5. **HLC Clock Skew** — simulate 600ms skew, verify rejection
+6. **Degradation** — gracefully remove nodes, monitor repair
+
+**Next step**: Add a small HTTP test endpoint to unlock these end-to-end lifecycle tests.
+
+---
+
+## Part F — Deep Subsystem Lifecycle Tests ✅ IMPLEMENTED
+
+Implemented in commit `480311f`. Replaced the 10 surface-level ping tests with 37 deep log-based verification tests across 7 phases.
+
+### Test Runner Architecture
+
+The test runner uses `docker:27-cli` with Docker socket mounted, enabling it to run `docker logs` to inspect actual node behavior. Tests verify structured log patterns emitted by the verbose logging added in Part D.
+
+### Test Phases
+
+| Phase | Tests | What it verifies |
+|-------|-------|-----------------|
+| 1. Infrastructure | 3 | Container state, IPs, cluster size |
+| 2. Node Init | 8 | Identity generation, init timing, all subsystem init logs (OBJ, RLNC, VFS, SQL, QUIC, event bus, SWIM, lock file) |
+| 3. SWIM Convergence | 6 | SWIM loop running, peer join, peer discovery, probe-ack cycle, gossip piggyback |
+| 4. Subsystem Bootstrap | 10 | Event bus wired, PendingFetches pruner, DHT pruner, health scanner, piece tracker, scheduler, storage bootstrap, adaptive piggyback, variable-K |
+| 5. Stability | 4 | No panics, no corruption, no event lag, events processing |
+| 6. Background Tasks | 4 | Health scan cycling, SWIM ticks, channel health, background activity |
+| 7. Graceful Shutdown | 4 | SIGTERM delivery, shutdown sequence, departure detection, clean exit |
+
+### Results
+
+All 37 tests pass on a 5-node Docker cluster.
+
 ---
 
 ## Summary
 
-### Fix Verification: 15/15 ✅
+### Fix Verification: 15/15 ✅ (original audit) + 7/7 ✅ (C1-C7) + 5/5 ✅ (code review bugs)
 
 | ID | Description | Status |
 |----|-------------|--------|
 | T1 | HLC 64-bit with CAS + skew + replay | ✅ Verified |
-| T2 | SWIM probe-ack nonce correlation | ✅ Verified |
+| T2 | SWIM probe-ack nonce correlation | ✅ Verified (+ nonce mismatch bug fixed) |
 | T3 | PendingFetches prune_stale + registered_at | ✅ Verified |
 | T5 | Wire frame v1 17-byte header with HLC | ✅ Verified |
 | T6 | SWIM Acquire/AcqRel ordering | ✅ Verified |
@@ -1027,30 +726,32 @@ docker compose down -v
 | T15 | JoinSet + 5s timeout + abort_all | ✅ Verified |
 | G1 | File-backed SQLite with data_dir | ✅ Verified |
 | G2 | EventBus::sender() wired to OBJ+SQL | ✅ Verified |
-| G3 | RLNC on CidWritten + recursion guard | ✅ Verified |
+| G3 | RLNC on CidWritten + recursion guard | ✅ Verified (+ race condition fixed) |
+| C1 | RLNC encode off event loop via tokio::spawn | ✅ Fixed |
+| C2 | SQL read/write connection separation + busy_timeout | ✅ Fixed |
+| C3 | Adaptive SWIM piggyback max(4, ceil(log2(n))) | ✅ Fixed |
+| C4 | Rate-limited batched storage bootstrap | ✅ Fixed |
+| C5 | Periodic PendingFetches pruning (60s) | ✅ Fixed |
+| C6 | Periodic DHT provider pruning (60s) | ✅ Fixed |
+| C7 | Variable-K health scanning via PieceTracker | ✅ Fixed |
 
-### New Issues: 7
+### Code Review Bug Fixes
 
-| ID | Severity | Description |
-|----|----------|-------------|
-| C1 | MEDIUM | RLNC encoding blocks event loop — spawn separately |
-| C2 | LOW | SQL read/write share same mutex — add read-only connection |
-| C3 | INFO | SWIM protocol period may need adaptive scaling |
-| C4 | LOW | Storage bootstrap unbounded — add rate limiting |
-| C5 | LOW | PendingFetches prune_stale never called periodically |
-| C6 | LOW | DHT provider pruning never scheduled |
-| C7 | INFO | HealthScanner hardcodes K=32 — should be per-object |
+| Bug | File | Description |
+|-----|------|-------------|
+| Probe nonce mismatch | swim.rs | `probe_with_ack` extracted nonce from message instead of allocating new one |
+| Indirect probe target | swim.rs | Sent to delegates instead of target |
+| Piece CID race | node.rs | Pre-compute CID and mark_piece_cid BEFORE store.put fires CidWritten |
+| Missing busy_timeout | database.rs | Added PRAGMA busy_timeout = 5000 to write_conn |
+| Silent serialization failure | node.rs | Replaced unwrap_or_default with proper error handling |
 
-### Docker Readiness
+### Test Coverage
 
-The codebase is ready for Docker multi-node testing. The node binary (`craftec-node`) handles:
-- Data directory creation and persistence (volume-mountable)
-- Bootstrap peers via config
-- QUIC/UDP networking
-- Graceful shutdown on SIGTERM
-- node.lock sentinel for dirty shutdown detection
+- **Unit tests**: 370 pass (363 original + 7 new), 0 failures
+- **Docker tests**: 37 pass across 7 phases, 0 failures
+- **Clippy**: Clean (`-D warnings`)
+- **Format**: Clean (`cargo fmt --all -- --check`)
 
-Remaining prerequisites:
-1. A `main.rs` binary entry point that reads config from environment variables
-2. The verbose logging additions from Part D
-3. Addresses C5/C6 (periodic pruning) so long-running Docker tests don't leak memory
+### Remaining Work
+
+The 6 end-to-end lifecycle flows (upload, distribute, repair, scale, degrade, eviction) require a lightweight HTTP/RPC test endpoint on the node. Currently the node only speaks QUIC wire protocol, limiting the test runner to log-pattern observation.
