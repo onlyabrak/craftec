@@ -23,6 +23,7 @@ use craftec_sql::RpcWriteHandler;
 use craftec_types::{CodedPiece, NodeId, WireMessage};
 
 use crate::pending::PendingFetches;
+use crate::piece_store::CodedPieceIndex;
 
 /// Full-featured message handler wired to node subsystems.
 pub struct NodeMessageHandler {
@@ -31,6 +32,7 @@ pub struct NodeMessageHandler {
     dht: Arc<DhtProviders>,
     pending: Arc<PendingFetches>,
     rpc_write: Arc<RpcWriteHandler>,
+    piece_index: Arc<CodedPieceIndex>,
     local_id: NodeId,
 }
 
@@ -41,6 +43,7 @@ impl NodeMessageHandler {
         dht: Arc<DhtProviders>,
         pending: Arc<PendingFetches>,
         rpc_write: Arc<RpcWriteHandler>,
+        piece_index: Arc<CodedPieceIndex>,
         local_id: NodeId,
     ) -> Self {
         Self {
@@ -49,6 +52,7 @@ impl NodeMessageHandler {
             dht,
             pending,
             rpc_write,
+            piece_index,
             local_id,
         }
     }
@@ -61,6 +65,7 @@ impl ConnectionHandler for NodeMessageHandler {
         let dht = Arc::clone(&self.dht);
         let pending = Arc::clone(&self.pending);
         let rpc_write = Arc::clone(&self.rpc_write);
+        let piece_index = Arc::clone(&self.piece_index);
         let _local_id = self.local_id;
 
         Box::pin(async move {
@@ -75,20 +80,37 @@ impl ConnectionHandler for NodeMessageHandler {
                     None
                 }
 
-                WireMessage::PieceRequest { cid, piece_indices } => {
+                WireMessage::PieceRequest {
+                    cid,
+                    piece_indices,
+                    request_id,
+                } => {
                     tracing::debug!(
                         peer = %from,
                         cid = %cid,
                         indices = ?piece_indices,
+                        request_id,
                         "Handler: PieceRequest"
                     );
 
-                    // Try to serve from local store.
+                    // Try to serve real coded pieces from the piece index.
+                    if let Some(pcids) = piece_index.get(&cid) {
+                        let mut pieces = Vec::new();
+                        for pcid in &pcids {
+                            if let Ok(Some(bytes)) = store.get(pcid).await
+                                && let Ok(piece) = postcard::from_bytes::<CodedPiece>(&bytes)
+                            {
+                                pieces.push(piece);
+                            }
+                        }
+                        if !pieces.is_empty() {
+                            return Some(WireMessage::PieceResponse { pieces, request_id });
+                        }
+                    }
+
+                    // Fallback: serve identity-coded piece from raw data.
                     match store.get(&cid).await {
                         Ok(Some(data)) => {
-                            // Wrap raw data as a simple coded piece with identity
-                            // coding vector. Full RLNC piece-level serving is wired
-                            // in Phase 3 via the piece tracker.
                             let cv = vec![1u8]; // identity coding vector
                             let hommac_key =
                                 craftec_crypto::hommac::HomMacKey::from_bytes(*cid.as_bytes());
@@ -96,11 +118,15 @@ impl ConnectionHandler for NodeMessageHandler {
                             let piece = CodedPiece::new(cid, cv, data.to_vec(), tag);
                             Some(WireMessage::PieceResponse {
                                 pieces: vec![piece],
+                                request_id,
                             })
                         }
                         Ok(None) => {
                             tracing::debug!(cid = %cid, "Handler: PieceRequest — CID not found locally");
-                            Some(WireMessage::PieceResponse { pieces: vec![] })
+                            Some(WireMessage::PieceResponse {
+                                pieces: vec![],
+                                request_id,
+                            })
                         }
                         Err(e) => {
                             tracing::warn!(cid = %cid, error = %e, "Handler: PieceRequest — store error");
@@ -109,7 +135,7 @@ impl ConnectionHandler for NodeMessageHandler {
                     }
                 }
 
-                WireMessage::PieceResponse { pieces } => {
+                WireMessage::PieceResponse { pieces, .. } => {
                     tracing::debug!(
                         peer = %from,
                         count = pieces.len(),
@@ -231,11 +257,24 @@ mod tests {
         let tracker = Arc::new(PieceTracker::new());
         let dht = Arc::new(DhtProviders::new());
         let pending = Arc::new(PendingFetches::new());
+        let piece_index = Arc::new(CodedPieceIndex::new());
         let local_id = NodeId::generate();
         let vfs = Arc::new(CidVfs::with_default_page_size(Arc::clone(&store)).unwrap());
-        let db = Arc::new(CraftDatabase::create(local_id, vfs).await.unwrap());
+        let db = Arc::new(
+            CraftDatabase::create(local_id, vfs, &tmp.path().join("sql"))
+                .await
+                .unwrap(),
+        );
         let rpc_write = Arc::new(RpcWriteHandler::new(db));
-        let handler = NodeMessageHandler::new(store, tracker, dht, pending, rpc_write, local_id);
+        let handler = NodeMessageHandler::new(
+            store,
+            tracker,
+            dht,
+            pending,
+            rpc_write,
+            piece_index,
+            local_id,
+        );
         (handler, tmp)
     }
 
@@ -260,11 +299,17 @@ mod tests {
                 WireMessage::PieceRequest {
                     cid,
                     piece_indices: vec![],
+                    request_id: 7,
                 },
             )
             .await;
         match reply {
-            Some(WireMessage::PieceResponse { pieces }) => assert!(pieces.is_empty()),
+            Some(WireMessage::PieceResponse {
+                pieces, request_id, ..
+            }) => {
+                assert!(pieces.is_empty());
+                assert_eq!(request_id, 7, "request_id should be echoed");
+            }
             other => panic!("expected empty PieceResponse, got {:?}", other),
         }
     }

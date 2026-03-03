@@ -39,12 +39,18 @@
 
 use std::sync::Arc;
 
+use craftec_types::hlc::HybridClock;
 use craftec_types::{NodeConfig, NodeId, NodeKeypair, WireMessage};
+
+use std::time::Duration;
 
 use crate::connection::ConnectionHandler;
 use crate::error::{NetError, Result};
 use crate::pool::ConnectionPool;
 use crate::swim::SwimMembership;
+
+/// Timeout for QUIC stream reads (T11 fix — prevents stalled peers from blocking).
+const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ── ALPN identifiers ────────────────────────────────────────────────────────
 
@@ -72,6 +78,8 @@ pub struct CraftecEndpoint {
     node_id: NodeId,
     connections: Arc<ConnectionPool>,
     swim: Arc<SwimMembership>,
+    /// Hybrid Logical Clock for distributed event ordering (T1).
+    hlc: Arc<HybridClock>,
 }
 
 impl CraftecEndpoint {
@@ -102,6 +110,7 @@ impl CraftecEndpoint {
 
         let connections = Arc::new(ConnectionPool::with_capacity(config.max_connections));
         let swim = Arc::new(SwimMembership::new(node_id));
+        let hlc = Arc::new(HybridClock::new());
 
         tracing::info!(
             node_id = %node_id,
@@ -113,6 +122,7 @@ impl CraftecEndpoint {
             node_id,
             connections,
             swim,
+            hlc,
         })
     }
 
@@ -138,6 +148,11 @@ impl CraftecEndpoint {
     /// Return a reference to the SWIM membership table.
     pub fn swim(&self) -> &Arc<SwimMembership> {
         &self.swim
+    }
+
+    /// Return a reference to the Hybrid Logical Clock.
+    pub fn hlc(&self) -> &Arc<HybridClock> {
+        &self.hlc
     }
 
     // ── Dialling ─────────────────────────────────────────────────────────
@@ -193,9 +208,10 @@ impl CraftecEndpoint {
             "CraftecEndpoint: sending message"
         );
 
-        // Serialize first — cheap to fail before touching the network.
-        let bytes = postcard::to_allocvec(msg)
-            .map_err(|e| NetError::SerializationError(format!("postcard encode failed: {e}")))?;
+        // Serialize with frame header + HLC timestamp.
+        let hlc_ts = self.hlc.now();
+        let bytes = craftec_types::wire::encode_framed_with_hlc(msg, hlc_ts)
+            .map_err(|e| NetError::SerializationError(format!("encode_framed failed: {e}")))?;
 
         // Try the connection pool first.
         let conn = if let Some(cached) = self.connections.get(peer) {
@@ -306,11 +322,13 @@ impl CraftecEndpoint {
                 // Spawn a task to read wire messages from this connection
                 // and dispatch them through the application handler.
                 let h = Arc::clone(&handler);
-                tokio::spawn(Self::handle_craftec_conn(conn, node_id, h));
+                let hlc = Arc::clone(&self.hlc);
+                tokio::spawn(Self::handle_craftec_conn(conn, node_id, h, hlc));
             } else if alpn == ALPN_SWIM {
                 let swim = self.swim.clone();
                 let node_id = NodeId::from_bytes(*remote_id.as_bytes());
-                tokio::spawn(Self::handle_swim_conn(conn, node_id, swim));
+                let hlc = Arc::clone(&self.hlc);
+                tokio::spawn(Self::handle_swim_conn(conn, node_id, swim, hlc));
             } else {
                 tracing::warn!(
                     remote = %remote_id,
@@ -416,6 +434,7 @@ impl CraftecEndpoint {
         conn: iroh::endpoint::Connection,
         remote: NodeId,
         handler: Arc<H>,
+        hlc: Arc<HybridClock>,
     ) {
         loop {
             let mut stream = match conn.accept_uni().await {
@@ -426,11 +445,24 @@ impl CraftecEndpoint {
                 }
             };
 
-            // Read the full stream payload (bounded to 4 MiB to prevent abuse).
-            match stream.read_to_end(4 * 1024 * 1024).await {
-                Ok(bytes) => {
-                    match postcard::from_bytes::<WireMessage>(&bytes) {
-                        Ok(msg) => {
+            // Read the full stream payload (bounded to 4 MiB, 30s timeout — T11 fix).
+            match tokio::time::timeout(STREAM_READ_TIMEOUT, stream.read_to_end(4 * 1024 * 1024))
+                .await
+            {
+                Ok(Ok(bytes)) => {
+                    match craftec_types::wire::decode_framed_with_hlc(&bytes) {
+                        Ok((msg, hlc_ts)) => {
+                            // Observe remote HLC timestamp (T1).
+                            if hlc_ts > 0
+                                && let Err(e) = hlc.observe(hlc_ts)
+                            {
+                                tracing::warn!(
+                                    peer = %remote,
+                                    error = %e,
+                                    "CraftecEndpoint: HLC check failed — dropping message"
+                                );
+                                continue;
+                            }
                             tracing::debug!(
                                 peer = %remote,
                                 msg_type = msg.type_name(),
@@ -439,7 +471,7 @@ impl CraftecEndpoint {
                             );
                             // Dispatch to the application-layer handler.
                             if let Some(reply) = handler.handle_message(remote, msg).await {
-                                match postcard::to_allocvec(&reply) {
+                                match craftec_types::wire::encode_framed(&reply) {
                                     Ok(reply_bytes) => match conn.open_uni().await {
                                         Ok(mut send_stream) => {
                                             if let Err(e) =
@@ -468,9 +500,13 @@ impl CraftecEndpoint {
                         }
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::warn!(peer = %remote, error = %e, "CraftecEndpoint: stream read error");
                     break;
+                }
+                Err(_) => {
+                    tracing::warn!(peer = %remote, "CraftecEndpoint: stream read timed out (30s)");
+                    continue;
                 }
             }
         }
@@ -481,6 +517,7 @@ impl CraftecEndpoint {
         conn: iroh::endpoint::Connection,
         remote: NodeId,
         swim: Arc<SwimMembership>,
+        hlc: Arc<HybridClock>,
     ) {
         loop {
             let mut stream = match conn.accept_uni().await {
@@ -491,12 +528,42 @@ impl CraftecEndpoint {
                 }
             };
 
-            match stream.read_to_end(64 * 1024).await {
-                Ok(bytes) => match postcard::from_bytes::<WireMessage>(&bytes) {
-                    Ok(msg) => {
+            match tokio::time::timeout(STREAM_READ_TIMEOUT, stream.read_to_end(64 * 1024)).await {
+                Ok(Ok(bytes)) => match craftec_types::wire::decode_framed_with_hlc(&bytes) {
+                    Ok((msg, hlc_ts)) => {
+                        // Observe remote HLC timestamp (T1).
+                        if hlc_ts > 0
+                            && let Err(e) = hlc.observe(hlc_ts)
+                        {
+                            tracing::warn!(
+                                peer = %remote,
+                                error = %e,
+                                "CraftecEndpoint: SWIM HLC check failed — dropping"
+                            );
+                            continue;
+                        }
+                        // T2: intercept SwimPingAck to resolve pending probes
+                        // before normal handle_message processing.
+                        if let WireMessage::SwimPingAck {
+                            from,
+                            nonce,
+                            incarnation,
+                        } = &msg
+                        {
+                            tracing::debug!(
+                                peer = %from,
+                                nonce,
+                                incarnation,
+                                "CraftecEndpoint: SWIM PingAck received"
+                            );
+                            swim.resolve_probe(*nonce, *incarnation);
+                            swim.mark_alive(from, *incarnation);
+                            continue;
+                        }
+
                         let responses = swim.handle_message(&msg);
                         for response in &responses {
-                            match postcard::to_allocvec(response) {
+                            match craftec_types::wire::encode_framed(response) {
                                 Ok(resp_bytes) => match conn.open_uni().await {
                                     Ok(mut send_stream) => {
                                         if let Err(e) = send_stream.write_all(&resp_bytes).await {
@@ -523,9 +590,13 @@ impl CraftecEndpoint {
                         );
                     }
                 },
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::warn!(peer = %remote, error = %e, "CraftecEndpoint: SWIM stream read error");
                     break;
+                }
+                Err(_) => {
+                    tracing::warn!(peer = %remote, "CraftecEndpoint: SWIM stream read timed out (30s)");
+                    continue;
                 }
             }
         }

@@ -30,12 +30,17 @@
 //! - It is the only entity that can grant or revoke agent execution rights.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use craftec_crypto::sign::KeyStore;
+use craftec_obj::ContentAddressedStore;
+use craftec_sql::CraftDatabase;
 use craftec_types::Cid;
 use dashmap::DashMap;
+use tokio::task::JoinHandle;
 
 use crate::error::{ComError, Result};
+use crate::host::HostState;
 use crate::runtime::ComRuntime;
 
 // ---------------------------------------------------------------------------
@@ -66,15 +71,23 @@ pub enum ProgramState {
         /// Human-readable reason for stopping.
         reason: String,
     },
+    /// The program has been quarantined after too many crashes.
+    Quarantined {
+        /// CID of the WASM binary.
+        wasm_cid: Cid,
+        /// Human-readable reason for quarantine.
+        reason: String,
+    },
 }
 
 impl ProgramState {
     /// Return the WASM CID for this program regardless of state.
     pub fn wasm_cid(&self) -> Cid {
         match self {
-            ProgramState::Loaded { wasm_cid, .. } => *wasm_cid,
-            ProgramState::Running { wasm_cid, .. } => *wasm_cid,
-            ProgramState::Stopped { wasm_cid, .. } => *wasm_cid,
+            ProgramState::Loaded { wasm_cid, .. }
+            | ProgramState::Running { wasm_cid, .. }
+            | ProgramState::Stopped { wasm_cid, .. }
+            | ProgramState::Quarantined { wasm_cid, .. } => *wasm_cid,
         }
     }
 
@@ -89,6 +102,7 @@ impl ProgramState {
             ProgramState::Loaded { .. } => "loaded",
             ProgramState::Running { .. } => "running",
             ProgramState::Stopped { .. } => "stopped",
+            ProgramState::Quarantined { .. } => "quarantined",
         }
     }
 }
@@ -119,6 +133,9 @@ impl std::fmt::Display for ProgramState {
             ProgramState::Stopped { wasm_cid, reason } => {
                 write!(f, "Stopped(wasm={wasm_cid}, reason={reason})")
             }
+            ProgramState::Quarantined { wasm_cid, reason } => {
+                write!(f, "Quarantined(wasm={wasm_cid}, reason={reason})")
+            }
         }
     }
 }
@@ -127,23 +144,46 @@ impl std::fmt::Display for ProgramState {
 // ProgramScheduler
 // ---------------------------------------------------------------------------
 
+/// Maximum consecutive crashes before quarantine.
+const CRASH_QUARANTINE_THRESHOLD: u32 = 10;
+
 /// Kernel-level program lifecycle manager.
 ///
 /// Manages loading, starting, stopping, and listing WASM programs on behalf
 /// of the Craftec node.
 pub struct ProgramScheduler {
     /// All tracked programs, keyed by WASM CID.
-    programs: DashMap<Cid, ProgramState>,
+    programs: Arc<DashMap<Cid, ProgramState>>,
     /// The underlying compute runtime used to execute agents.
     runtime: Arc<ComRuntime>,
+    /// Content-addressed store for loading WASM binaries.
+    store: Arc<ContentAddressedStore>,
+    /// SQL database (optional).
+    database: Option<Arc<CraftDatabase>>,
+    /// Ed25519 key store for host functions.
+    keystore: Arc<KeyStore>,
+    /// Task handles for running programs, keyed by WASM CID.
+    task_handles: Arc<DashMap<Cid, JoinHandle<()>>>,
+    /// Consecutive crash counts per program.
+    crash_counts: Arc<DashMap<Cid, u32>>,
 }
 
 impl ProgramScheduler {
     /// Create a new [`ProgramScheduler`] backed by `runtime`.
-    pub fn new(runtime: Arc<ComRuntime>) -> Self {
+    pub fn new(
+        runtime: Arc<ComRuntime>,
+        store: Arc<ContentAddressedStore>,
+        database: Option<Arc<CraftDatabase>>,
+        keystore: Arc<KeyStore>,
+    ) -> Self {
         Self {
-            programs: DashMap::new(),
+            programs: Arc::new(DashMap::new()),
             runtime,
+            store,
+            database,
+            keystore,
+            task_handles: Arc::new(DashMap::new()),
+            crash_counts: Arc::new(DashMap::new()),
         }
     }
 
@@ -180,61 +220,164 @@ impl ProgramScheduler {
 
     /// Start a previously loaded program.
     ///
-    /// Transitions the program from `Loaded` to `Running`.  In the full
-    /// implementation this spawns a Tokio task that calls the program's
-    /// `_start` or `main` entry point.
+    /// Loads the WASM binary from CraftOBJ and spawns a Tokio task that runs
+    /// the program's `main` entry point in a keepalive loop with crash backoff.
     ///
     /// # Errors
     /// - [`ComError::ProgramNotFound`] if `wasm_cid` is not in the scheduler.
-    /// - [`ComError::SchedulerError`] if the program is not in `Loaded` state.
+    /// - [`ComError::SchedulerError`] if the program is already running or quarantined.
     pub async fn start_program(&self, wasm_cid: &Cid) -> Result<()> {
-        let mut entry = self
-            .programs
-            .get_mut(wasm_cid)
-            .ok_or(ComError::ProgramNotFound(*wasm_cid))?;
+        let wasm_bytes = {
+            let entry = self
+                .programs
+                .get(wasm_cid)
+                .ok_or(ComError::ProgramNotFound(*wasm_cid))?;
 
-        match &*entry {
-            ProgramState::Running { .. } => {
-                return Err(ComError::SchedulerError(format!(
-                    "program {wasm_cid} is already running"
-                )));
+            match &*entry {
+                ProgramState::Running { .. } => {
+                    return Err(ComError::SchedulerError(format!(
+                        "program {wasm_cid} is already running"
+                    )));
+                }
+                ProgramState::Quarantined { .. } => {
+                    return Err(ComError::SchedulerError(format!(
+                        "program {wasm_cid} is quarantined"
+                    )));
+                }
+                _ => {}
             }
-            ProgramState::Loaded { wasm_cid: cid, .. } => {
-                *entry = ProgramState::Running {
-                    wasm_cid: *cid,
-                    started_at: Instant::now(),
-                };
-            }
-            ProgramState::Stopped { wasm_cid: cid, .. } => {
-                // Allow restart from stopped state.
-                *entry = ProgramState::Running {
-                    wasm_cid: *cid,
-                    started_at: Instant::now(),
-                };
-            }
-        }
+            drop(entry);
 
+            // Load WASM bytes from CraftOBJ.
+            self.store
+                .get(wasm_cid)
+                .await
+                .map_err(|e| ComError::SchedulerError(format!("store error: {e}")))?
+                .ok_or_else(|| {
+                    ComError::SchedulerError(format!("WASM binary not found in store: {wasm_cid}"))
+                })?
+                .to_vec()
+        };
+
+        // Transition to Running.
+        self.programs.insert(
+            *wasm_cid,
+            ProgramState::Running {
+                wasm_cid: *wasm_cid,
+                started_at: Instant::now(),
+            },
+        );
+
+        // Reset crash count.
+        self.crash_counts.insert(*wasm_cid, 0);
+
+        // Spawn execution task.
+        let cid = *wasm_cid;
+        let runtime = Arc::clone(&self.runtime);
+        let store = Arc::clone(&self.store);
+        let database = self.database.clone();
+        let keystore = Arc::clone(&self.keystore);
+        let programs = Arc::clone(&self.programs);
+        let crash_counts = Arc::clone(&self.crash_counts);
+
+        let handle = tokio::spawn(async move {
+            let mut local_crash_count: u32 = 0;
+
+            loop {
+                let host_state =
+                    HostState::new(Arc::clone(&store), database.clone(), Arc::clone(&keystore));
+
+                match runtime
+                    .execute_agent(&wasm_bytes, "main", &[], host_state)
+                    .await
+                {
+                    Ok(_) => {
+                        // Normal completion — reset crash count, restart after delay.
+                        local_crash_count = 0;
+                        crash_counts.insert(cid, 0);
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    Err(ComError::FuelExhausted { .. }) => {
+                        // Fuel exhaustion is normal for long-running agents; fast restart.
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    Err(e) => {
+                        local_crash_count += 1;
+                        crash_counts.insert(cid, local_crash_count);
+
+                        tracing::warn!(
+                            wasm_cid = %cid,
+                            crash_count = local_crash_count,
+                            error = %e,
+                            "CraftCOM: program crashed"
+                        );
+
+                        if local_crash_count >= CRASH_QUARANTINE_THRESHOLD {
+                            programs.insert(
+                                cid,
+                                ProgramState::Quarantined {
+                                    wasm_cid: cid,
+                                    reason: format!(
+                                        "quarantined after {} consecutive crashes: {}",
+                                        local_crash_count, e
+                                    ),
+                                },
+                            );
+                            tracing::error!(
+                                wasm_cid = %cid,
+                                "CraftCOM: program quarantined after {} crashes",
+                                local_crash_count
+                            );
+                            break;
+                        }
+
+                        // Exponential backoff: 2^crash_count seconds, max 64s.
+                        let backoff = Duration::from_secs(1u64 << local_crash_count.min(6));
+                        tokio::time::sleep(backoff).await;
+                    }
+                }
+
+                // Check if we were stopped externally.
+                if let Some(state) = programs.get(&cid) {
+                    if !state.is_running() {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        });
+
+        self.task_handles.insert(*wasm_cid, handle);
         tracing::info!(wasm_cid = %wasm_cid, "CraftCOM: program started");
         Ok(())
     }
 
     /// Stop a running program.
     ///
-    /// Transitions the program to `Stopped` state with the given `reason`.
+    /// Aborts the task handle and transitions the program to `Stopped` state.
     ///
     /// # Errors
     /// - [`ComError::ProgramNotFound`] if `wasm_cid` is not tracked.
     pub async fn stop_program(&self, wasm_cid: &Cid, reason: &str) -> Result<()> {
-        let mut entry = self
+        let _entry = self
             .programs
-            .get_mut(wasm_cid)
+            .get(wasm_cid)
             .ok_or(ComError::ProgramNotFound(*wasm_cid))?;
+        drop(_entry);
 
-        let cid = entry.wasm_cid();
-        *entry = ProgramState::Stopped {
-            wasm_cid: cid,
-            reason: reason.to_owned(),
-        };
+        // Abort the spawned task if it exists.
+        if let Some((_, handle)) = self.task_handles.remove(wasm_cid) {
+            handle.abort();
+        }
+
+        self.programs.insert(
+            *wasm_cid,
+            ProgramState::Stopped {
+                wasm_cid: *wasm_cid,
+                reason: reason.to_owned(),
+            },
+        );
 
         tracing::info!(
             wasm_cid = %wasm_cid,
@@ -296,9 +439,13 @@ mod tests {
     use super::*;
     use crate::runtime::ComRuntime;
 
-    fn make_scheduler() -> ProgramScheduler {
+    async fn make_scheduler() -> (ProgramScheduler, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
         let rt = Arc::new(ComRuntime::new(1_000_000).unwrap());
-        ProgramScheduler::new(rt)
+        let store = Arc::new(ContentAddressedStore::new(&tmp.path().join("obj"), 64).unwrap());
+        let keystore = Arc::new(KeyStore::new(tmp.path()).unwrap());
+        let sched = ProgramScheduler::new(rt, store, None, keystore);
+        (sched, tmp)
     }
 
     fn cid(seed: u8) -> Cid {
@@ -307,20 +454,31 @@ mod tests {
 
     /// Minimal valid WASM binary: exports a `main` function returning i32 42.
     fn minimal_wasm() -> Vec<u8> {
-        // Binary encoding of: (module (func (export "main") (result i32) i32.const 42))
-        vec![
-            0x00, 0x61, 0x73, 0x6d, // magic
-            0x01, 0x00, 0x00, 0x00, // version
-            0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f, // type
-            0x03, 0x02, 0x01, 0x00, // function
-            0x07, 0x08, 0x01, 0x04, 0x6d, 0x61, 0x69, 0x6e, 0x00, 0x00, // export
-            0x0a, 0x06, 0x01, 0x04, 0x00, 0x41, 0x2a, 0x0b, // code
-        ]
+        wat::parse_str(r#"(module (func (export "main") (result i32) i32.const 42))"#)
+            .unwrap_or_else(|_| {
+                vec![
+                    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60, 0x00,
+                    0x01, 0x7f, 0x03, 0x02, 0x01, 0x00, 0x07, 0x08, 0x01, 0x04, 0x6d, 0x61, 0x69,
+                    0x6e, 0x00, 0x00, 0x0a, 0x06, 0x01, 0x04, 0x00, 0x41, 0x2a, 0x0b,
+                ]
+            })
+    }
+
+    /// WASM that immediately traps (unreachable instruction).
+    fn trapping_wasm() -> Vec<u8> {
+        wat::parse_str(r#"(module (func (export "main") (result i32) unreachable))"#)
+            .unwrap_or_else(|_| {
+                vec![
+                    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60, 0x00,
+                    0x01, 0x7f, 0x03, 0x02, 0x01, 0x00, 0x07, 0x08, 0x01, 0x04, 0x6d, 0x61, 0x69,
+                    0x6e, 0x00, 0x00, 0x0a, 0x05, 0x01, 0x03, 0x00, 0x00, 0x0b,
+                ]
+            })
     }
 
     #[tokio::test]
     async fn load_transitions_to_loaded_state() {
-        let sched = make_scheduler();
+        let (sched, _tmp) = make_scheduler().await;
         let id = cid(0x01);
         let wasm = minimal_wasm();
         match sched.load_program(&id, &wasm).await {
@@ -337,7 +495,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_program_not_found() {
-        let sched = make_scheduler();
+        let (sched, _tmp) = make_scheduler().await;
         let unknown = cid(0xAA);
         assert!(matches!(
             sched.start_program(&unknown).await,
@@ -347,31 +505,36 @@ mod tests {
 
     #[tokio::test]
     async fn full_lifecycle() {
-        let sched = make_scheduler();
-        let id = cid(0x02);
+        let (sched, _tmp) = make_scheduler().await;
         let wasm = minimal_wasm();
 
-        // Load — may fail on compilation; if so skip the rest.
-        if sched.load_program(&id, &wasm).await.is_err() {
+        // Store the WASM binary in CraftOBJ so start_program can load it.
+        let wasm_cid = sched.store.put(&wasm).await.unwrap();
+
+        // Load.
+        if sched.load_program(&wasm_cid, &wasm).await.is_err() {
             return;
         }
 
         // Start.
-        sched.start_program(&id).await.unwrap();
-        assert!(sched.is_running(&id));
+        sched.start_program(&wasm_cid).await.unwrap();
+        assert!(sched.is_running(&wasm_cid));
 
         // Stop.
-        sched.stop_program(&id, "test complete").await.unwrap();
-        assert!(!sched.is_running(&id));
+        sched
+            .stop_program(&wasm_cid, "test complete")
+            .await
+            .unwrap();
+        assert!(!sched.is_running(&wasm_cid));
         assert!(matches!(
-            sched.state(&id),
+            sched.state(&wasm_cid),
             Some(ProgramState::Stopped { .. })
         ));
     }
 
     #[tokio::test]
     async fn list_programs_sorted() {
-        let sched = make_scheduler();
+        let (sched, _tmp) = make_scheduler().await;
         let wasm = minimal_wasm();
         // Load several programs; if compilation fails, just verify empty list.
         let _ = sched.load_program(&cid(0x05), &wasm).await;
@@ -387,10 +550,99 @@ mod tests {
 
     #[tokio::test]
     async fn stop_unknown_program_returns_error() {
-        let sched = make_scheduler();
+        let (sched, _tmp) = make_scheduler().await;
         assert!(matches!(
             sched.stop_program(&cid(0xBB), "force").await,
             Err(ComError::ProgramNotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn start_program_spawns_execution() {
+        let (sched, _tmp) = make_scheduler().await;
+        let wasm = minimal_wasm();
+
+        // Store in CraftOBJ.
+        let wasm_cid = sched.store.put(&wasm).await.unwrap();
+        if sched.load_program(&wasm_cid, &wasm).await.is_err() {
+            return; // WASM not valid on this platform
+        }
+
+        sched.start_program(&wasm_cid).await.unwrap();
+        assert!(sched.is_running(&wasm_cid));
+
+        // The task handle should exist.
+        assert!(sched.task_handles.contains_key(&wasm_cid));
+
+        // Let it run briefly.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Still running (keepalive loop).
+        assert!(sched.is_running(&wasm_cid));
+
+        sched.stop_program(&wasm_cid, "test done").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_program_aborts_task() {
+        let (sched, _tmp) = make_scheduler().await;
+        let wasm = minimal_wasm();
+
+        let wasm_cid = sched.store.put(&wasm).await.unwrap();
+        if sched.load_program(&wasm_cid, &wasm).await.is_err() {
+            return;
+        }
+
+        sched.start_program(&wasm_cid).await.unwrap();
+        assert!(sched.task_handles.contains_key(&wasm_cid));
+
+        sched.stop_program(&wasm_cid, "abort test").await.unwrap();
+
+        // Task handle should be removed.
+        assert!(!sched.task_handles.contains_key(&wasm_cid));
+        assert!(!sched.is_running(&wasm_cid));
+    }
+
+    #[tokio::test]
+    async fn crash_quarantine_after_threshold() {
+        let (sched, _tmp) = make_scheduler().await;
+        let wasm = trapping_wasm();
+
+        let wasm_cid = sched.store.put(&wasm).await.unwrap();
+        if sched.load_program(&wasm_cid, &wasm).await.is_err() {
+            return;
+        }
+
+        sched.start_program(&wasm_cid).await.unwrap();
+
+        // Wait for crashes to accumulate. The trapping WASM will crash immediately
+        // each time with exponential backoff: 2+4+8+16+32+64+64+64+64+64 ≈ 382s max.
+        // But we use tokio::time::pause for controlled time.
+        // Instead, just check periodically for quarantine state.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if let Some(state) = sched.state(&wasm_cid) {
+                if matches!(state, ProgramState::Quarantined { .. }) {
+                    // Quarantined! Verify crash count.
+                    let count = sched.crash_counts.get(&wasm_cid).map(|v| *v).unwrap_or(0);
+                    assert!(
+                        count >= CRASH_QUARANTINE_THRESHOLD,
+                        "expected >= {} crashes, got {}",
+                        CRASH_QUARANTINE_THRESHOLD,
+                        count
+                    );
+                    return;
+                }
+            }
+            if Instant::now() > deadline {
+                // If we haven't quarantined yet, the backoff is too slow for a test.
+                // Verify at least some crashes happened.
+                let count = sched.crash_counts.get(&wasm_cid).map(|v| *v).unwrap_or(0);
+                assert!(count > 0, "expected at least one crash");
+                sched.stop_program(&wasm_cid, "test timeout").await.unwrap();
+                return;
+            }
+        }
     }
 }

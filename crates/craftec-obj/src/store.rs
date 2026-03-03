@@ -98,6 +98,7 @@ struct Inner {
     cache: ObjectCache,
     bloom: RwLock<CidBloomFilter>,
     metrics: StoreMetrics,
+    event_tx: RwLock<Option<tokio::sync::broadcast::Sender<craftec_types::Event>>>,
 }
 
 // ─── ContentAddressedStore ──────────────────────────────────────────────────
@@ -163,6 +164,7 @@ impl ContentAddressedStore {
             cache: ObjectCache::new(cache_capacity),
             bloom: RwLock::new(bloom),
             metrics: StoreMetrics::default(),
+            event_tx: RwLock::new(None),
         });
 
         info!(
@@ -174,6 +176,15 @@ impl ContentAddressedStore {
         );
 
         Ok(ContentAddressedStore { inner })
+    }
+
+    /// Inject an event sender so the store can publish [`CidWritten`](craftec_types::Event::CidWritten)
+    /// events after successful writes.
+    ///
+    /// Called after the event bus is initialised — the store is created before
+    /// the bus, so this uses a post-init setter rather than constructor injection.
+    pub fn set_event_sender(&self, tx: tokio::sync::broadcast::Sender<craftec_types::Event>) {
+        *self.inner.event_tx.write() = Some(tx);
     }
 
     // ── Write ────────────────────────────────────────────────────────────────
@@ -234,6 +245,11 @@ impl ContentAddressedStore {
         // Update in-memory state.
         self.inner.bloom.write().insert(&cid);
         self.inner.cache.put(cid, Bytes::copy_from_slice(data));
+
+        // Publish CidWritten event (only on actual writes, not dedup).
+        if let Some(tx) = self.inner.event_tx.read().as_ref() {
+            let _ = tx.send(craftec_types::Event::CidWritten { cid });
+        }
 
         trace!(cid = %cid, size = data.len(), "CraftOBJ: put object — write complete");
         Ok(cid)
@@ -788,5 +804,44 @@ mod tests {
         let cid = store.put(b"shared").await.unwrap();
         // The clone should see the same object.
         assert!(clone.contains(&cid).await);
+    }
+
+    // ── Event publishing ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn put_publishes_cid_written_event() {
+        let (store, _dir) = make_store().await;
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        store.set_event_sender(tx);
+
+        let cid = store.put(b"event-test-data").await.unwrap();
+
+        let event = rx.recv().await.unwrap();
+        match event {
+            craftec_types::Event::CidWritten { cid: ecid } => assert_eq!(ecid, cid),
+            other => panic!("expected CidWritten, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn put_dedup_does_not_publish() {
+        let (store, _dir) = make_store().await;
+        let data = b"dedup-test";
+
+        // First put (no event sender yet).
+        store.put(data).await.unwrap();
+
+        // Now attach sender.
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        store.set_event_sender(tx);
+
+        // Second put should dedup — no event.
+        store.put(data).await.unwrap();
+
+        // Channel should be empty.
+        assert!(
+            rx.try_recv().is_err(),
+            "dedup path should not publish event"
+        );
     }
 }

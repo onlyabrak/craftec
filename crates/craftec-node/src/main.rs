@@ -33,6 +33,7 @@ mod event_bus;
 mod handler;
 mod node;
 mod pending;
+mod piece_store;
 mod shutdown;
 
 #[tokio::main]

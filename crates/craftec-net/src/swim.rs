@@ -38,11 +38,12 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use tokio::sync::oneshot;
 
 use craftec_types::{NodeId, WireMessage};
 
-/// Default time before a `Suspect` node is declared `Dead` (§13).
-const DEFAULT_SUSPECT_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Default time before a `Suspect` node is declared `Dead` (spec §18: 5 seconds).
+const DEFAULT_SUSPECT_TIMEOUT: Duration = Duration::from_millis(5000);
 
 /// Default protocol tick period — one random peer is probed per tick (§13).
 const DEFAULT_PROTOCOL_PERIOD: Duration = Duration::from_millis(500);
@@ -97,6 +98,10 @@ pub struct SwimMembership {
     pub protocol_period: Duration,
     /// Index into the shuffled probe order (round-robin across members).
     probe_index: AtomicUsize,
+    /// Monotonic counter for probe nonces (T2: probe-ack correlation).
+    probe_nonce: AtomicU64,
+    /// Pending probe acks keyed by nonce.
+    pending_probes: DashMap<u64, oneshot::Sender<u64>>,
 }
 
 impl SwimMembership {
@@ -117,6 +122,8 @@ impl SwimMembership {
             suspect_timeout: DEFAULT_SUSPECT_TIMEOUT,
             protocol_period: DEFAULT_PROTOCOL_PERIOD,
             probe_index: AtomicUsize::new(0),
+            probe_nonce: AtomicU64::new(0),
+            pending_probes: DashMap::new(),
         }
     }
 
@@ -148,78 +155,84 @@ impl SwimMembership {
 
     /// Return the local node's current incarnation number.
     pub fn current_incarnation(&self) -> u64 {
-        self.incarnation.load(Ordering::Relaxed)
+        self.incarnation.load(Ordering::Acquire)
     }
 
     // ── State transitions ──────────────────────────────────────────────────
 
     /// Mark `node_id` as `Alive` with the given `incarnation`.
     ///
-    /// Only applies if `incarnation` ≥ the currently recorded incarnation, ensuring
-    /// monotonically increasing state.
+    /// Uses entry-based atomic update to prevent TOCTOU races between
+    /// concurrent state transitions (T7 fix).
     pub fn mark_alive(&self, node_id: &NodeId, incarnation: u64) {
         if node_id == &self.local_id {
             return; // Never update own entry — local state is authoritative.
         }
-        let should_update = self
-            .members
-            .get(node_id)
-            .map(|e| match e.value() {
-                MemberState::Alive { incarnation: inc } => incarnation > *inc,
-                MemberState::Suspect {
-                    incarnation: inc, ..
-                } => incarnation >= *inc,
-                MemberState::Dead { incarnation: inc } => incarnation > *inc,
+        self.members
+            .entry(*node_id)
+            .and_modify(|state| {
+                let dominated = match state {
+                    MemberState::Alive { incarnation: inc } => incarnation <= *inc,
+                    MemberState::Suspect {
+                        incarnation: inc, ..
+                    } => incarnation < *inc,
+                    MemberState::Dead { incarnation: inc } => incarnation <= *inc,
+                };
+                if !dominated {
+                    tracing::debug!(node = %node_id, incarnation, "SWIM: mark_alive (update)");
+                    *state = MemberState::Alive { incarnation };
+                }
             })
-            .unwrap_or(true); // Unknown node → insert
-
-        if should_update {
-            tracing::debug!(node = %node_id, incarnation, "SWIM: mark_alive");
-            self.members
-                .insert(*node_id, MemberState::Alive { incarnation });
-        }
+            .or_insert_with(|| {
+                tracing::debug!(node = %node_id, incarnation, "SWIM: mark_alive (new)");
+                MemberState::Alive { incarnation }
+            });
     }
 
     /// Mark `node_id` as `Suspect`.
     ///
-    /// Only transitions from `Alive` (or unknown) — will not override a higher-incarnation
-    /// `Alive` or an existing `Dead` state.
+    /// Uses entry-based atomic update to prevent TOCTOU races (T7 fix).
+    /// Will not override a higher-incarnation `Alive` or an existing `Dead` state.
     pub fn mark_suspect(&self, node_id: &NodeId, incarnation: u64) {
         if node_id == &self.local_id {
             // We are suspected — refute by incrementing our own incarnation.
-            let new_inc = self.incarnation.fetch_add(1, Ordering::Relaxed) + 1;
+            let new_inc = self.incarnation.fetch_add(1, Ordering::AcqRel) + 1;
             tracing::info!(
                 new_incarnation = new_inc,
                 "SWIM: refuting suspect claim on self"
             );
             return;
         }
-        let should_update = self
-            .members
-            .get(node_id)
-            .map(|e| match e.value() {
-                MemberState::Alive { incarnation: inc } => incarnation >= *inc,
-                MemberState::Suspect {
-                    incarnation: inc, ..
-                } => incarnation > *inc,
-                MemberState::Dead { .. } => false, // Dead is terminal.
+        self.members
+            .entry(*node_id)
+            .and_modify(|state| {
+                let should_update = match state {
+                    MemberState::Alive { incarnation: inc } => incarnation >= *inc,
+                    MemberState::Suspect {
+                        incarnation: inc, ..
+                    } => incarnation > *inc,
+                    MemberState::Dead { .. } => false, // Dead is terminal.
+                };
+                if should_update {
+                    tracing::debug!(node = %node_id, incarnation, "SWIM: mark_suspect (update)");
+                    *state = MemberState::Suspect {
+                        incarnation,
+                        since: Instant::now(),
+                    };
+                }
             })
-            .unwrap_or(true);
-
-        if should_update {
-            tracing::debug!(node = %node_id, incarnation, "SWIM: mark_suspect");
-            self.members.insert(
-                *node_id,
+            .or_insert_with(|| {
+                tracing::debug!(node = %node_id, incarnation, "SWIM: mark_suspect (new)");
                 MemberState::Suspect {
                     incarnation,
                     since: Instant::now(),
-                },
-            );
-        }
+                }
+            });
     }
 
     /// Mark `node_id` as `Dead`.
     ///
+    /// Uses entry-based atomic update to prevent TOCTOU races (T7 fix).
     /// `Dead` is terminal — it cannot be overridden by `Suspect` or an equal-incarnation
     /// `Alive`.  A higher-incarnation `Alive` from the node itself can revive it.
     pub fn mark_dead(&self, node_id: &NodeId, incarnation: u64) {
@@ -227,20 +240,69 @@ impl SwimMembership {
             tracing::warn!("SWIM: received Dead claim about self — ignoring");
             return;
         }
-        let should_update = self
-            .members
+        self.members
+            .entry(*node_id)
+            .and_modify(|state| {
+                let should_update = match state {
+                    MemberState::Dead { incarnation: inc } => incarnation > *inc,
+                    _ => true,
+                };
+                if should_update {
+                    tracing::info!(node = %node_id, incarnation, "SWIM: mark_dead (update)");
+                    *state = MemberState::Dead { incarnation };
+                }
+            })
+            .or_insert_with(|| {
+                tracing::info!(node = %node_id, incarnation, "SWIM: mark_dead (new)");
+                MemberState::Dead { incarnation }
+            });
+    }
+
+    // ── Probe-ack support (T2) ────────────────────────────────────────────
+
+    /// Allocate a new probe nonce and return a `(nonce, receiver)` pair.
+    /// The receiver resolves when the remote node acks with the same nonce.
+    pub fn register_probe(&self) -> (u64, oneshot::Receiver<u64>) {
+        let nonce = self.probe_nonce.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.pending_probes.insert(nonce, tx);
+        (nonce, rx)
+    }
+
+    /// Resolve a pending probe by nonce. Called when a SwimPingAck arrives.
+    /// Returns `true` if the probe was still pending.
+    pub fn resolve_probe(&self, nonce: u64, incarnation: u64) -> bool {
+        if let Some((_, tx)) = self.pending_probes.remove(&nonce) {
+            let _ = tx.send(incarnation);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Return up to `count` random alive members excluding `exclude`.
+    pub fn random_alive_excluding(&self, exclude: &NodeId, count: usize) -> Vec<NodeId> {
+        use rand::seq::SliceRandom;
+        let mut alive: Vec<NodeId> = self
+            .alive_members()
+            .into_iter()
+            .filter(|id| id != exclude)
+            .collect();
+        alive.shuffle(&mut rand::thread_rng());
+        alive.truncate(count);
+        alive
+    }
+
+    /// Return the last known incarnation for `node_id`, or 0 if unknown.
+    pub fn last_known_incarnation(&self, node_id: &NodeId) -> u64 {
+        self.members
             .get(node_id)
             .map(|e| match e.value() {
-                MemberState::Dead { incarnation: inc } => incarnation > *inc,
-                _ => true,
+                MemberState::Alive { incarnation } => *incarnation,
+                MemberState::Suspect { incarnation, .. } => *incarnation,
+                MemberState::Dead { incarnation } => *incarnation,
             })
-            .unwrap_or(true);
-
-        if should_update {
-            tracing::info!(node = %node_id, incarnation, "SWIM: mark_dead");
-            self.members
-                .insert(*node_id, MemberState::Dead { incarnation });
-        }
+            .unwrap_or(0)
     }
 
     // ── Protocol message handling ──────────────────────────────────────────
@@ -272,7 +334,7 @@ impl SwimMembership {
                 );
                 self.mark_alive(node_id, 0); // initial incarnation 0
                 // Respond with our own Alive so the joiner learns about us.
-                let own_inc = self.incarnation.load(Ordering::Relaxed);
+                let own_inc = self.incarnation.load(Ordering::Acquire);
                 responses.push(WireMessage::SwimAlive {
                     node_id: self.local_id,
                     incarnation: own_inc,
@@ -320,9 +382,14 @@ impl SwimMembership {
                 responses.push(msg.clone());
             }
 
-            WireMessage::SwimPing { from, piggyback } => {
+            WireMessage::SwimPing {
+                from,
+                nonce,
+                piggyback,
+            } => {
                 tracing::debug!(
                     from = %from,
+                    nonce,
                     piggyback_count = piggyback.len(),
                     "SWIM: processed SwimPing"
                 );
@@ -331,12 +398,28 @@ impl SwimMembership {
                     let sub_responses = self.handle_message(piggybacked_msg);
                     responses.extend(sub_responses);
                 }
-                // Respond with our own Alive to confirm liveness (probe ack).
-                let own_inc = self.incarnation.load(Ordering::Relaxed);
-                responses.push(WireMessage::SwimAlive {
-                    node_id: self.local_id,
+                // Respond with SwimPingAck (replaces old SwimAlive response).
+                let own_inc = self.incarnation.load(Ordering::Acquire);
+                responses.push(WireMessage::SwimPingAck {
+                    from: self.local_id,
+                    nonce: *nonce,
                     incarnation: own_inc,
                 });
+            }
+
+            WireMessage::SwimPingAck {
+                from,
+                nonce,
+                incarnation,
+            } => {
+                tracing::debug!(
+                    from = %from,
+                    nonce,
+                    incarnation,
+                    "SWIM: processed SwimPingAck"
+                );
+                self.mark_alive(from, *incarnation);
+                self.resolve_probe(*nonce, *incarnation);
             }
 
             _ => {
@@ -398,12 +481,16 @@ impl SwimMembership {
         // so the wire format doesn't require MemberState in craftec-types.
         let piggyback = self.collect_gossip_msgs(4); // up to 4 updates piggybacked
 
+        // Allocate a nonce for probe-ack correlation (T2).
+        let nonce = self.probe_nonce.fetch_add(1, Ordering::Relaxed);
+
         let ping = WireMessage::SwimPing {
             from: self.local_id,
+            nonce,
             piggyback,
         };
 
-        tracing::trace!(probe_target = %target, "SWIM: sending probe ping");
+        tracing::trace!(probe_target = %target, nonce, "SWIM: sending probe ping");
         vec![(target, ping)]
     }
 
@@ -453,34 +540,42 @@ impl SwimMembership {
 
 // ── Long-running protocol loop ─────────────────────────────────────────────
 
-/// Start the SWIM background loop.
+/// Ack timeout for direct probe (400ms).
+const ACK_TIMEOUT: Duration = Duration::from_millis(400);
+
+/// Ack timeout for indirect probe (800ms).
+const INDIRECT_ACK_TIMEOUT: Duration = Duration::from_millis(800);
+
+/// Number of delegates for indirect probe (ping-req).
+const INDIRECT_PROBE_K: usize = 3;
+
+/// Start the SWIM background loop with full probe-ack-suspect cycle (T2 fix).
 ///
-/// Runs one [`SwimMembership::protocol_tick`] per `swim.protocol_period` until a
-/// signal is received on `shutdown`.
-///
-/// Probes are dispatched to peers via `endpoint.send_message()`.
+/// Per tick:
+/// 1. Run `protocol_tick()` to expire suspects and select a target.
+/// 2. Send `SwimPing` → register probe → await ack (400ms).
+/// 3. On timeout: send indirect probe to K=3 random delegates.
+/// 4. On second timeout (800ms): `mark_suspect(target)`.
 pub async fn run_swim_loop(
     swim: Arc<SwimMembership>,
     endpoint: Arc<crate::endpoint::CraftecEndpoint>,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) {
     let period = swim.protocol_period;
-    tracing::info!(?period, "SWIM: background loop started");
+    tracing::info!(
+        ?period,
+        "SWIM: background loop started (with probe-ack cycle)"
+    );
 
     loop {
         tokio::select! {
             _ = tokio::time::sleep(period) => {
                 let probes = swim.protocol_tick().await;
                 for (target, msg) in probes {
-                    let ep = endpoint.clone();
+                    let swim = Arc::clone(&swim);
+                    let ep = Arc::clone(&endpoint);
                     tokio::spawn(async move {
-                        if let Err(e) = ep.send_message(&target, &msg).await {
-                            tracing::debug!(
-                                peer = %target,
-                                error = %e,
-                                "SWIM: failed to send probe"
-                            );
-                        }
+                        probe_with_ack(swim, ep, target, msg).await;
                     });
                 }
             }
@@ -488,6 +583,74 @@ pub async fn run_swim_loop(
                 tracing::info!("SWIM: shutdown signal received — stopping loop");
                 break;
             }
+        }
+    }
+}
+
+/// Execute a single probe with ack-wait, indirect probe, and suspect-on-timeout.
+async fn probe_with_ack(
+    swim: Arc<SwimMembership>,
+    endpoint: Arc<crate::endpoint::CraftecEndpoint>,
+    target: NodeId,
+    msg: WireMessage,
+) {
+    // Step 1: Register the probe and send the ping.
+    let (nonce, rx) = swim.register_probe();
+
+    if let Err(e) = endpoint.send_message(&target, &msg).await {
+        tracing::debug!(peer = %target, error = %e, "SWIM: failed to send probe");
+        return;
+    }
+
+    // Step 2: Wait for direct ack (400ms).
+    match tokio::time::timeout(ACK_TIMEOUT, rx).await {
+        Ok(Ok(_incarnation)) => {
+            // Ack received — target is alive.
+            tracing::trace!(peer = %target, nonce, "SWIM: probe ack received");
+            return;
+        }
+        _ => {
+            tracing::debug!(peer = %target, nonce, "SWIM: direct probe timeout — trying indirect");
+        }
+    }
+
+    // Step 3: Indirect probe — ask K random delegates to ping the target.
+    let delegates = swim.random_alive_excluding(&target, INDIRECT_PROBE_K);
+    if delegates.is_empty() {
+        tracing::debug!(peer = %target, "SWIM: no delegates for indirect probe — marking suspect");
+        let inc = swim.last_known_incarnation(&target);
+        swim.mark_suspect(&target, inc);
+        return;
+    }
+
+    let (indirect_nonce, indirect_rx) = swim.register_probe();
+    let piggyback = vec![];
+    let indirect_ping = WireMessage::SwimPing {
+        from: *endpoint.node_id(),
+        nonce: indirect_nonce,
+        piggyback,
+    };
+
+    for _delegate in &delegates {
+        // Send the ping directly to target through each delegate's path.
+        // Future: replace with a proper PingReq relay message.
+        let ep = Arc::clone(&endpoint);
+        let t = target;
+        let m = indirect_ping.clone();
+        tokio::spawn(async move {
+            let _ = ep.send_message(&t, &m).await;
+        });
+    }
+
+    // Step 4: Wait for indirect ack (800ms).
+    match tokio::time::timeout(INDIRECT_ACK_TIMEOUT, indirect_rx).await {
+        Ok(Ok(_incarnation)) => {
+            tracing::trace!(peer = %target, "SWIM: indirect probe ack received");
+        }
+        _ => {
+            tracing::info!(peer = %target, "SWIM: all probes timed out — marking suspect");
+            let inc = swim.last_known_incarnation(&target);
+            swim.mark_suspect(&target, inc);
         }
     }
 }
@@ -599,11 +762,16 @@ mod tests {
         let probes = swim.protocol_tick().await;
         assert_eq!(probes.len(), 1);
         assert_eq!(probes[0].0, peer);
-        assert!(matches!(probes[0].1, WireMessage::SwimPing { .. }));
+        match &probes[0].1 {
+            WireMessage::SwimPing { nonce, .. } => {
+                assert!(*nonce < u64::MAX, "nonce should be a valid u64");
+            }
+            other => panic!("expected SwimPing, got {:?}", other),
+        }
     }
 
     #[test]
-    fn handle_swim_ping_responds_with_alive() {
+    fn handle_swim_ping_responds_with_ping_ack() {
         let local = NodeId::generate();
         let swim = SwimMembership::new(local);
         let peer = NodeId::generate();
@@ -611,6 +779,7 @@ mod tests {
         let piggyback_node = NodeId::generate();
         let msg = WireMessage::SwimPing {
             from: peer,
+            nonce: 42,
             piggyback: vec![WireMessage::SwimAlive {
                 node_id: piggyback_node,
                 incarnation: 1,
@@ -618,19 +787,60 @@ mod tests {
         };
 
         let responses = swim.handle_message(&msg);
-        // Should contain at least our own SwimAlive ack.
+        // Should contain a SwimPingAck with the same nonce.
         assert!(responses.iter().any(|r| matches!(
             r,
-            WireMessage::SwimAlive { node_id, .. } if *node_id == local
+            WireMessage::SwimPingAck { from, nonce: 42, .. } if *from == local
         )));
         // Piggybacked node should be marked alive.
         assert!(swim.is_alive(&piggyback_node));
     }
 
     #[test]
+    fn probe_ack_resolves_pending() {
+        let swim = make_swim();
+        let (nonce, mut rx) = swim.register_probe();
+        assert!(swim.resolve_probe(nonce, 5));
+        // The receiver should now have the incarnation value.
+        assert_eq!(rx.try_recv().unwrap(), 5);
+    }
+
+    #[test]
+    fn probe_timeout_leaves_pending_unresolved() {
+        let swim = make_swim();
+        let (nonce, _rx) = swim.register_probe();
+        // Resolving with a different nonce should not resolve this probe.
+        assert!(!swim.resolve_probe(nonce + 999, 5));
+    }
+
+    #[test]
     fn swim_parameters_match_spec() {
         let swim = make_swim();
         assert_eq!(swim.protocol_period, Duration::from_millis(500));
-        assert_eq!(swim.suspect_timeout, Duration::from_millis(1500));
+        // T8: spec §18 requires 5000ms suspect timeout.
+        assert_eq!(swim.suspect_timeout, Duration::from_millis(5000));
+    }
+
+    #[test]
+    fn mark_alive_does_not_regress_dead() {
+        // T7: verify that entry-based update prevents lower-incarnation Alive
+        // from overriding higher-incarnation Dead.
+        let swim = make_swim();
+        let peer = NodeId::generate();
+        swim.mark_dead(&peer, 7);
+        swim.mark_alive(&peer, 5); // lower incarnation — must NOT override
+        assert!(
+            !swim.is_alive(&peer),
+            "Alive(5) should not override Dead(7)"
+        );
+        // Even equal incarnation must not override Dead.
+        swim.mark_alive(&peer, 7);
+        assert!(
+            !swim.is_alive(&peer),
+            "Alive(7) should not override Dead(7)"
+        );
+        // Higher incarnation revives.
+        swim.mark_alive(&peer, 8);
+        assert!(swim.is_alive(&peer), "Alive(8) should revive Dead(7)");
     }
 }

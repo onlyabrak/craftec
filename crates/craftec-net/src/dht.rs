@@ -7,7 +7,7 @@
 //!
 //! # Current architecture
 //!
-//! The table is an in-memory `DashMap<Cid, HashSet<NodeId>>`.  Announcements from
+//! The table is an in-memory `DashMap<Cid, Vec<ProviderRecord>>`.  Announcements from
 //! peers are ingested via [`DhtProviders::announce_provider`] and resolved with
 //! [`DhtProviders::get_providers`].  There is no persistence or TTL expiry — callers
 //! are responsible for removing stale entries via [`DhtProviders::remove_provider`].
@@ -18,7 +18,7 @@
 //! - TTL + re-announcement timers.
 //! - Kademlia XOR routing once `iroh-dht-experiment` stabilises.
 
-use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use rand::seq::SliceRandom;
@@ -27,6 +27,15 @@ use craftec_types::{Cid, NodeId, WireMessage};
 
 use crate::endpoint::CraftecEndpoint;
 
+// ── Provider record ────────────────────────────────────────────────────────
+
+/// A provider record with a timestamp for TTL-based expiry (T13 fix).
+#[derive(Debug, Clone)]
+struct ProviderRecord {
+    node_id: NodeId,
+    announced_at: Instant,
+}
+
 // ── Main type ──────────────────────────────────────────────────────────────
 
 /// Manages CID → provider mappings for the local Craftec node.
@@ -34,8 +43,8 @@ use crate::endpoint::CraftecEndpoint;
 /// Thread-safe and clone-friendly (all clones share state via inner `Arc`).
 #[derive(Clone, Default)]
 pub struct DhtProviders {
-    /// Maps each known CID to the set of nodes that have announced holding it.
-    local_providers: DashMap<Cid, HashSet<NodeId>>,
+    /// Maps each known CID to the list of provider records (with timestamps).
+    local_providers: DashMap<Cid, Vec<ProviderRecord>>,
 }
 
 impl DhtProviders {
@@ -47,7 +56,7 @@ impl DhtProviders {
 
     /// Record that `node_id` holds (or can serve) `cid`.
     ///
-    /// Idempotent — calling this multiple times with the same arguments is a no-op.
+    /// If `node_id` is already a provider for `cid`, refreshes the `announced_at` timestamp.
     pub fn announce_provider(&self, cid: &Cid, node_id: &NodeId) {
         tracing::debug!(
             cid = %cid,
@@ -56,8 +65,23 @@ impl DhtProviders {
         );
         self.local_providers
             .entry(*cid)
-            .or_default()
-            .insert(*node_id);
+            .and_modify(|records| {
+                if let Some(existing) = records.iter_mut().find(|r| r.node_id == *node_id) {
+                    // Refresh timestamp on re-announce.
+                    existing.announced_at = Instant::now();
+                } else {
+                    records.push(ProviderRecord {
+                        node_id: *node_id,
+                        announced_at: Instant::now(),
+                    });
+                }
+            })
+            .or_insert_with(|| {
+                vec![ProviderRecord {
+                    node_id: *node_id,
+                    announced_at: Instant::now(),
+                }]
+            });
     }
 
     /// Return the list of nodes known to hold `cid`.
@@ -67,7 +91,7 @@ impl DhtProviders {
         let providers: Vec<NodeId> = self
             .local_providers
             .get(cid)
-            .map(|set| set.iter().copied().collect())
+            .map(|records| records.iter().map(|r| r.node_id).collect())
             .unwrap_or_default();
 
         tracing::debug!(
@@ -82,9 +106,10 @@ impl DhtProviders {
     ///
     /// If `node_id` was the last provider, the CID entry is also removed.
     pub fn remove_provider(&self, cid: &Cid, node_id: &NodeId) {
-        if let Some(mut set) = self.local_providers.get_mut(cid) {
-            let removed = set.remove(node_id);
-            if removed {
+        if let Some(mut records) = self.local_providers.get_mut(cid) {
+            let before = records.len();
+            records.retain(|r| r.node_id != *node_id);
+            if records.len() < before {
                 tracing::debug!(cid = %cid, node = %node_id, "DHT: removed provider");
             }
         }
@@ -97,17 +122,46 @@ impl DhtProviders {
     /// Called when a node is declared dead by the SWIM membership layer.
     pub fn remove_node(&self, node_id: &NodeId) {
         let mut removed_count = 0usize;
-        self.local_providers.retain(|_cid, providers| {
-            if providers.remove(node_id) {
+        self.local_providers.retain(|_cid, records| {
+            let before = records.len();
+            records.retain(|r| r.node_id != *node_id);
+            if records.len() < before {
                 removed_count += 1;
             }
-            !providers.is_empty() // drop empty entries
+            !records.is_empty() // drop empty entries
         });
         tracing::debug!(
             node = %node_id,
             cids_affected = removed_count,
             "DHT: node removed from all provider records"
         );
+    }
+
+    /// Remove provider records older than `ttl` (T13 fix).
+    ///
+    /// Returns the number of records pruned.
+    pub fn prune_stale(&self, ttl: Duration) -> usize {
+        let now = Instant::now();
+        let mut pruned = 0usize;
+
+        let cids: Vec<Cid> = self.local_providers.iter().map(|e| *e.key()).collect();
+
+        for cid in cids {
+            if let Some(mut records) = self.local_providers.get_mut(&cid) {
+                let before = records.len();
+                records.retain(|r| now.duration_since(r.announced_at) < ttl);
+                pruned += before - records.len();
+            }
+        }
+
+        // Clean up empty entries.
+        self.local_providers
+            .retain(|_, records| !records.is_empty());
+
+        if pruned > 0 {
+            tracing::debug!(pruned, "DHT: pruned stale provider records");
+        }
+        pruned
     }
 
     /// Return the total number of distinct CIDs tracked.
@@ -252,5 +306,48 @@ mod tests {
             dht.announce_provider(&cid, n);
         }
         assert_eq!(dht.get_providers(&cid).len(), 3);
+    }
+
+    #[test]
+    fn prune_stale_removes_old_providers() {
+        let dht = DhtProviders::new();
+        let cid = Cid::from_data(b"stale-test");
+        let node = NodeId::generate();
+
+        dht.announce_provider(&cid, &node);
+        assert_eq!(dht.provider_count(), 1);
+
+        // Prune with zero TTL — everything is stale.
+        let pruned = dht.prune_stale(Duration::ZERO);
+        assert_eq!(pruned, 1);
+        assert_eq!(dht.provider_count(), 0);
+        assert_eq!(dht.cid_count(), 0);
+    }
+
+    #[test]
+    fn prune_stale_keeps_fresh() {
+        let dht = DhtProviders::new();
+        let cid = Cid::from_data(b"fresh-test");
+        let node = NodeId::generate();
+
+        dht.announce_provider(&cid, &node);
+
+        // Prune with a generous TTL — nothing should be removed.
+        let pruned = dht.prune_stale(Duration::from_secs(60));
+        assert_eq!(pruned, 0);
+        assert_eq!(dht.provider_count(), 1);
+    }
+
+    #[test]
+    fn announce_refreshes_timestamp() {
+        let dht = DhtProviders::new();
+        let cid = Cid::from_data(b"refresh-test");
+        let node = NodeId::generate();
+
+        dht.announce_provider(&cid, &node);
+        // Re-announce should refresh, not duplicate.
+        dht.announce_provider(&cid, &node);
+        assert_eq!(dht.provider_count(), 1, "re-announce should not duplicate");
+        assert_eq!(dht.get_providers(&cid).len(), 1);
     }
 }

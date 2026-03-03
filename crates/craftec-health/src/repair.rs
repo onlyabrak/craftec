@@ -19,6 +19,7 @@
 //! erasure codes.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use craftec_net::CraftecEndpoint;
@@ -92,6 +93,8 @@ pub struct RepairExecutor {
     tracker: Arc<PieceTracker>,
     /// Rendezvous point for piece fetch responses arriving via the accept loop.
     pending: Arc<PendingFetches>,
+    /// Monotonic counter for unique request IDs (T10).
+    next_request_id: AtomicU64,
 }
 
 impl RepairExecutor {
@@ -107,6 +110,7 @@ impl RepairExecutor {
             net,
             tracker,
             pending,
+            next_request_id: AtomicU64::new(0),
         }
     }
 
@@ -162,6 +166,7 @@ impl RepairExecutor {
         // Step 5: distribute the recoded piece.
         let distribute_msg = WireMessage::PieceResponse {
             pieces: vec![recoded],
+            request_id: self.next_request_id.fetch_add(1, Ordering::Relaxed),
         };
 
         self.net
@@ -194,9 +199,11 @@ impl RepairExecutor {
         count: usize,
     ) -> Result<Vec<CodedPiece>> {
         let mut pieces = Vec::with_capacity(count);
+        let req_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let request_msg = WireMessage::PieceRequest {
             cid: *cid,
             piece_indices: vec![],
+            request_id: req_id,
         };
 
         for holder in holders.iter().take(count * 2) {

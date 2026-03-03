@@ -151,11 +151,15 @@ mod tests {
 
     async fn make_handler() -> (RpcWriteHandler, NodeKeypair, tempfile::TempDir) {
         let dir = tempdir().unwrap();
-        let store = Arc::new(ContentAddressedStore::new(dir.path(), 64).unwrap());
+        let store = Arc::new(ContentAddressedStore::new(&dir.path().join("obj"), 64).unwrap());
         let vfs = Arc::new(CidVfs::with_default_page_size(store).unwrap());
         let keypair = NodeKeypair::generate();
         let owner = keypair.node_id();
-        let db = Arc::new(CraftDatabase::create(owner, vfs).await.unwrap());
+        let db = Arc::new(
+            CraftDatabase::create(owner, vfs, &dir.path().join("sql"))
+                .await
+                .unwrap(),
+        );
         (RpcWriteHandler::new(db), keypair, dir)
     }
 

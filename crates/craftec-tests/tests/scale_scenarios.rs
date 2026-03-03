@@ -40,7 +40,7 @@ impl ScaleNode {
         let vfs = Arc::new(CidVfs::with_default_page_size(Arc::clone(&store)).unwrap());
         let keypair = NodeKeypair::generate();
         let database = Arc::new(
-            CraftDatabase::create(keypair.node_id(), Arc::clone(&vfs))
+            CraftDatabase::create(keypair.node_id(), Arc::clone(&vfs), &tmp.path().join("sql"))
                 .await
                 .unwrap(),
         );
@@ -511,8 +511,8 @@ async fn swim_suspect_timeout_promotes_to_dead() {
     }
     assert_eq!(swim.alive_members().len(), 7);
 
-    // Wait for suspect timeout (1500ms) + margin.
-    tokio::time::sleep(Duration::from_millis(1700)).await;
+    // Wait for suspect timeout (5000ms per spec §18) + margin.
+    tokio::time::sleep(Duration::from_millis(5200)).await;
 
     // A protocol tick should promote suspects to dead.
     swim.protocol_tick().await;

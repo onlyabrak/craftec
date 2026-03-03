@@ -263,8 +263,12 @@ fn wire_message_all_variants_round_trip() {
         WireMessage::PieceRequest {
             cid,
             piece_indices: vec![0, 1, 2],
+            request_id: 0,
         },
-        WireMessage::PieceResponse { pieces: vec![] },
+        WireMessage::PieceResponse {
+            pieces: vec![],
+            request_id: 0,
+        },
         WireMessage::ProviderAnnounce { cid, node_id },
         WireMessage::SignedWrite {
             payload: b"data".to_vec(),
@@ -297,6 +301,7 @@ fn wire_message_all_variants_round_trip() {
         },
         WireMessage::SwimPing {
             from: node_id,
+            nonce: 0,
             piggyback: vec![WireMessage::SwimAlive {
                 node_id: peer_id,
                 incarnation: 1,
@@ -427,13 +432,14 @@ fn full_pipeline_encode_sign_transmit_verify_decode() {
     // Serialize to wire
     let response = WireMessage::PieceResponse {
         pieces: pieces.clone(),
+        request_id: 0,
     };
     let wire_bytes = wire::encode(&response).expect("encode");
 
     // Node B: deserialize + verify
     let decoded_msg = wire::decode(&wire_bytes).expect("decode");
     let stored_pieces = match decoded_msg {
-        WireMessage::PieceResponse { pieces } => pieces,
+        WireMessage::PieceResponse { pieces, .. } => pieces,
         _ => panic!("expected PieceResponse"),
     };
 

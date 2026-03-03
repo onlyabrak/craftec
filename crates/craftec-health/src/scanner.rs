@@ -119,8 +119,8 @@ impl HealthScanner {
         let total = all_cids.len();
         let batch_size = ((total as f64 * self.scan_percent).ceil() as usize).max(1);
 
-        // Advance the cursor, wrapping at the end.
-        let start = self.last_scan_index.load(Ordering::Relaxed) % total;
+        // Advance the cursor, wrapping at the end (T14: use Acquire ordering).
+        let start = self.last_scan_index.load(Ordering::Acquire) % total;
         let end = (start + batch_size).min(total);
 
         let batch = &all_cids[start..end];
@@ -133,9 +133,9 @@ impl HealthScanner {
             &[]
         };
 
-        // Advance the cursor for the next cycle.
+        // Advance the cursor for the next cycle (T14: use Release ordering).
         self.last_scan_index
-            .store((start + batch_size) % total, Ordering::Relaxed);
+            .store((start + batch_size) % total, Ordering::Release);
 
         // Evaluate each CID in the batch.
         let mut repairs = Vec::new();

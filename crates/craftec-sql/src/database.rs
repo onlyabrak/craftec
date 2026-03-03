@@ -6,11 +6,9 @@
 //! issue mutations.
 //!
 //! ## SQL execution
-//! SQL is executed through an in-memory libsql database.  The VFS layer
-//! tracks commit points externally — each successful `execute()` produces
-//! a new root CID capturing the database state.  A full VFS bridge routing
-//! libsql page I/O through CidVfs will follow once the libsql VFS FFI
-//! stabilises.
+//! SQL is executed through a file-backed libsql database.  After each
+//! `execute()`, the actual SQLite pages are read from disk and synced to
+//! CID-VFS for content-addressed persistence.
 //!
 //! ## Row representation
 //! Query results are returned as a `Vec<Row>` where each [`Row`] is a
@@ -23,6 +21,7 @@
 //! reads use the snapshot API and never block each other; writes take a
 //! short exclusive lock only during the commit step.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use craftec_types::{Cid, NodeId, Signature};
@@ -114,7 +113,7 @@ fn libsql_value_to_column(val: libsql::Value) -> ColumnValue {
 /// CID, enabling concurrent reads without coordination.
 ///
 /// ## Lifecycle
-/// 1. `CraftDatabase::create(owner, vfs)` — initialise an empty database.
+/// 1. `CraftDatabase::create(owner, vfs, data_dir)` — initialise an empty database.
 /// 2. `execute(sql, writer)` — write path (owner-only).
 /// 3. `query(sql)` — read path (any reader, snapshot-isolated).
 pub struct CraftDatabase {
@@ -126,28 +125,41 @@ pub struct CraftDatabase {
     vfs: Arc<CidVfs>,
     /// Most recently committed root CID.
     root_cid: RwLock<Cid>,
-    /// In-memory libsql database (kept alive so the connection remains valid).
+    /// Path to the on-disk SQLite database file.
+    db_path: PathBuf,
+    /// File-backed libsql database (kept alive so the connection remains valid).
     _libsql_db: libsql::Database,
     /// libsql connection for executing SQL.  Protected by a tokio Mutex for
     /// serial write access (single-writer model).
     conn: tokio::sync::Mutex<libsql::Connection>,
+    /// Optional event sender for publishing PageCommitted events.
+    event_tx: RwLock<Option<tokio::sync::broadcast::Sender<craftec_types::Event>>>,
 }
 
 impl CraftDatabase {
     /// Create a new, empty [`CraftDatabase`] owned by `owner`.
     ///
-    /// Initialises an in-memory libsql database with the correct PRAGMAs
-    /// and commits an initial root CID through the VFS layer.
+    /// Initialises a file-backed libsql database at `data_dir/craftec.db`
+    /// with the correct PRAGMAs and commits the initial SQLite pages to
+    /// CID-VFS for content-addressed persistence.
     ///
     /// # Errors
+    /// - [`SqlError::Io`] if the data directory cannot be created.
     /// - [`SqlError::VfsError`] if the VFS layer fails during initialisation.
     /// - [`SqlError::LibsqlError`] if the libsql engine fails to start.
-    pub async fn create(owner: NodeId, vfs: Arc<CidVfs>) -> Result<Self> {
+    pub async fn create(
+        owner: NodeId,
+        vfs: Arc<CidVfs>,
+        data_dir: &std::path::Path,
+    ) -> Result<Self> {
         // Derive a stable database identity CID from the owner's public key bytes.
         let db_id = Cid::from_data(owner.as_bytes());
 
-        // Create in-memory libsql database.
-        let libsql_db = libsql::Builder::new_local(":memory:")
+        std::fs::create_dir_all(data_dir)?;
+        let db_path = data_dir.join("craftec.db");
+
+        // Create file-backed libsql database.
+        let libsql_db = libsql::Builder::new_local(&db_path)
             .build()
             .await
             .map_err(|e| SqlError::LibsqlError(e.to_string()))?;
@@ -165,26 +177,39 @@ impl CraftDatabase {
             .await
             .map_err(|e| SqlError::LibsqlError(e.to_string()))?;
 
+        // Force SQLite to write pages to disk so we can sync them to VFS.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS _craftec_meta (key TEXT PRIMARY KEY, value TEXT)",
+            (),
+        )
+        .await
+        .map_err(|e| SqlError::LibsqlError(e.to_string()))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO _craftec_meta VALUES ('version', '1')",
+            (),
+        )
+        .await
+        .map_err(|e| SqlError::LibsqlError(e.to_string()))?;
+
         tracing::info!(
             owner = %owner,
             db_id = %db_id,
+            db_path = %db_path.display(),
             "CraftSQL: database created",
         );
 
-        // Bootstrap: write a sentinel page 0 so the VFS has a root CID.
-        let mut bootstrap_page = vec![0u8; vfs.page_size()];
-        // Magic bytes so we can detect a Craftec-formatted database.
-        bootstrap_page[..8].copy_from_slice(b"CRAFTEC1");
-        vfs.write_page(0, &bootstrap_page)?;
-        let root = vfs.commit().await?;
+        // Sync the initial SQLite pages to VFS.
+        let root = Self::sync_pages_to_vfs(&db_path, &vfs).await?;
 
         Ok(Self {
             db_id,
             owner,
             vfs,
             root_cid: RwLock::new(root),
+            db_path,
             _libsql_db: libsql_db,
             conn: tokio::sync::Mutex::new(conn),
+            event_tx: RwLock::new(None),
         })
     }
 
@@ -221,29 +246,28 @@ impl CraftDatabase {
         );
 
         // Execute SQL through libsql.
+        // T9 fix: hold the conn mutex through the entire execute-commit cycle
+        // to prevent concurrent writes from interleaving VFS operations.
         let conn = self.conn.lock().await;
         conn.execute(sql, ())
             .await
             .map_err(|e| SqlError::SqlSyntaxError(e.to_string()))?;
-        drop(conn);
 
-        // Record the commit in VFS.  We write the SQL as page content to
-        // produce a unique root CID for each mutation (the real VFS bridge
-        // will capture actual SQLite page I/O in a future phase).
-        let mut page = vec![0u8; self.vfs.page_size()];
-        let sql_bytes = sql.as_bytes();
-        let copy_len = sql_bytes.len().min(page.len() - 8);
-        page[..8].copy_from_slice(b"CRAFTSQL");
-        page[8..8 + copy_len].copy_from_slice(&sql_bytes[..copy_len]);
-
-        // Use a page number derived from a hash of the SQL to avoid collisions
-        // between different statements in the same session.
-        let page_hash = blake3::hash(sql.as_bytes());
-        let page_num = u32::from_le_bytes(page_hash.as_bytes()[0..4].try_into().unwrap());
-
-        self.vfs.write_page(page_num, &page)?;
-        let new_root = self.vfs.commit().await?;
+        // Sync actual SQLite pages from the database file to CID-VFS.
+        let new_root = Self::sync_pages_to_vfs(&self.db_path, &self.vfs).await?;
         *self.root_cid.write() = new_root;
+
+        // Publish PageCommitted event.
+        if let Some(tx) = self.event_tx.read().as_ref() {
+            let _ = tx.send(craftec_types::Event::PageCommitted {
+                db_id: self.db_id,
+                page_num: 0,
+                root_cid: new_root,
+            });
+        }
+
+        // Release conn mutex AFTER VFS commit and root_cid update.
+        drop(conn);
 
         tracing::debug!(
             db_id = %self.db_id,
@@ -302,6 +326,29 @@ impl CraftDatabase {
         Ok(result)
     }
 
+    /// Inject an event sender so the database can publish
+    /// [`PageCommitted`](craftec_types::Event::PageCommitted) after each execute().
+    pub fn set_event_sender(&self, tx: tokio::sync::broadcast::Sender<craftec_types::Event>) {
+        *self.event_tx.write() = Some(tx);
+    }
+
+    // -----------------------------------------------------------------------
+    // Internal
+    // -----------------------------------------------------------------------
+
+    /// Read actual SQLite pages from the database file and write them to VFS.
+    async fn sync_pages_to_vfs(db_path: &std::path::Path, vfs: &CidVfs) -> Result<Cid> {
+        let db_bytes = tokio::fs::read(db_path).await?;
+        let page_size = vfs.page_size();
+        for (i, chunk) in db_bytes.chunks(page_size).enumerate() {
+            let mut page = vec![0u8; page_size];
+            page[..chunk.len()].copy_from_slice(chunk);
+            vfs.write_page(i as u32, &page)?;
+        }
+        let root = vfs.commit().await?;
+        Ok(root)
+    }
+
     // -----------------------------------------------------------------------
     // Accessors
     // -----------------------------------------------------------------------
@@ -325,6 +372,11 @@ impl CraftDatabase {
     pub fn vfs(&self) -> &Arc<CidVfs> {
         &self.vfs
     }
+
+    /// Return the path to the on-disk SQLite database file.
+    pub fn db_path(&self) -> &std::path::Path {
+        &self.db_path
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -341,10 +393,10 @@ mod tests {
 
     async fn make_db() -> (CraftDatabase, tempfile::TempDir) {
         let dir = tempdir().unwrap();
-        let store = Arc::new(ContentAddressedStore::new(dir.path(), 64).unwrap());
+        let store = Arc::new(ContentAddressedStore::new(&dir.path().join("obj"), 64).unwrap());
         let vfs = Arc::new(CidVfs::with_default_page_size(store).unwrap());
         let owner = NodeKeypair::generate().node_id();
-        let db = CraftDatabase::create(owner, vfs)
+        let db = CraftDatabase::create(owner, vfs, &dir.path().join("sql"))
             .await
             .expect("database creation should succeed");
         (db, dir)
@@ -360,11 +412,13 @@ mod tests {
     #[tokio::test]
     async fn owner_can_execute() {
         let dir = tempdir().unwrap();
-        let store = Arc::new(ContentAddressedStore::new(dir.path(), 64).unwrap());
+        let store = Arc::new(ContentAddressedStore::new(&dir.path().join("obj"), 64).unwrap());
         let vfs = Arc::new(CidVfs::with_default_page_size(store).unwrap());
         let kp = NodeKeypair::generate();
         let owner = kp.node_id();
-        let db = CraftDatabase::create(owner, vfs).await.unwrap();
+        let db = CraftDatabase::create(owner, vfs, &dir.path().join("sql"))
+            .await
+            .unwrap();
         assert!(
             db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", &owner)
                 .await
@@ -386,11 +440,13 @@ mod tests {
     #[tokio::test]
     async fn root_cid_changes_after_execute() {
         let dir = tempdir().unwrap();
-        let store = Arc::new(ContentAddressedStore::new(dir.path(), 64).unwrap());
+        let store = Arc::new(ContentAddressedStore::new(&dir.path().join("obj"), 64).unwrap());
         let vfs = Arc::new(CidVfs::with_default_page_size(store).unwrap());
         let kp = NodeKeypair::generate();
         let owner = kp.node_id();
-        let db = CraftDatabase::create(owner, vfs).await.unwrap();
+        let db = CraftDatabase::create(owner, vfs, &dir.path().join("sql"))
+            .await
+            .unwrap();
         let initial_root = db.root_cid();
         db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", &owner)
             .await
@@ -401,11 +457,13 @@ mod tests {
     #[tokio::test]
     async fn sql_write_and_read_roundtrip() {
         let dir = tempdir().unwrap();
-        let store = Arc::new(ContentAddressedStore::new(dir.path(), 64).unwrap());
+        let store = Arc::new(ContentAddressedStore::new(&dir.path().join("obj"), 64).unwrap());
         let vfs = Arc::new(CidVfs::with_default_page_size(store).unwrap());
         let kp = NodeKeypair::generate();
         let owner = kp.node_id();
-        let db = CraftDatabase::create(owner, vfs).await.unwrap();
+        let db = CraftDatabase::create(owner, vfs, &dir.path().join("sql"))
+            .await
+            .unwrap();
 
         // CREATE TABLE, INSERT, then SELECT.
         db.execute(
@@ -435,11 +493,13 @@ mod tests {
     #[tokio::test]
     async fn query_empty_table_returns_no_rows() {
         let dir = tempdir().unwrap();
-        let store = Arc::new(ContentAddressedStore::new(dir.path(), 64).unwrap());
+        let store = Arc::new(ContentAddressedStore::new(&dir.path().join("obj"), 64).unwrap());
         let vfs = Arc::new(CidVfs::with_default_page_size(store).unwrap());
         let kp = NodeKeypair::generate();
         let owner = kp.node_id();
-        let db = CraftDatabase::create(owner, vfs).await.unwrap();
+        let db = CraftDatabase::create(owner, vfs, &dir.path().join("sql"))
+            .await
+            .unwrap();
 
         db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", &owner)
             .await
@@ -451,11 +511,13 @@ mod tests {
     #[tokio::test]
     async fn sql_column_types() {
         let dir = tempdir().unwrap();
-        let store = Arc::new(ContentAddressedStore::new(dir.path(), 64).unwrap());
+        let store = Arc::new(ContentAddressedStore::new(&dir.path().join("obj"), 64).unwrap());
         let vfs = Arc::new(CidVfs::with_default_page_size(store).unwrap());
         let kp = NodeKeypair::generate();
         let owner = kp.node_id();
-        let db = CraftDatabase::create(owner, vfs).await.unwrap();
+        let db = CraftDatabase::create(owner, vfs, &dir.path().join("sql"))
+            .await
+            .unwrap();
 
         db.execute(
             "CREATE TABLE types_test (i INTEGER, r REAL, t TEXT, b BLOB, n INTEGER)",
@@ -482,13 +544,123 @@ mod tests {
     #[tokio::test]
     async fn invalid_sql_returns_error() {
         let dir = tempdir().unwrap();
-        let store = Arc::new(ContentAddressedStore::new(dir.path(), 64).unwrap());
+        let store = Arc::new(ContentAddressedStore::new(&dir.path().join("obj"), 64).unwrap());
         let vfs = Arc::new(CidVfs::with_default_page_size(store).unwrap());
         let kp = NodeKeypair::generate();
         let owner = kp.node_id();
-        let db = CraftDatabase::create(owner, vfs).await.unwrap();
+        let db = CraftDatabase::create(owner, vfs, &dir.path().join("sql"))
+            .await
+            .unwrap();
 
         let result = db.execute("THIS IS NOT VALID SQL", &owner).await;
         assert!(matches!(result, Err(SqlError::SqlSyntaxError(_))));
+    }
+
+    #[tokio::test]
+    async fn database_file_exists_after_create() {
+        let (db, _dir) = make_db().await;
+        assert!(db.db_path().exists(), "database file should exist on disk");
+    }
+
+    #[tokio::test]
+    async fn vfs_pages_are_real_sqlite_pages() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(ContentAddressedStore::new(&dir.path().join("obj"), 64).unwrap());
+        let vfs = Arc::new(CidVfs::with_default_page_size(Arc::clone(&store)).unwrap());
+        let kp = NodeKeypair::generate();
+        let owner = kp.node_id();
+        let db = CraftDatabase::create(owner, vfs, &dir.path().join("sql"))
+            .await
+            .unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", &owner)
+            .await
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'hello')", &owner)
+            .await
+            .unwrap();
+
+        // The file on disk should be at least page_size bytes.
+        let file_size = std::fs::metadata(db.db_path()).unwrap().len();
+        assert!(
+            file_size >= db.vfs().page_size() as u64,
+            "database file ({file_size} bytes) should be at least one page"
+        );
+
+        // VFS snapshot page count should match the file pages.
+        let snapshot = db.vfs().snapshot().unwrap();
+        assert!(
+            snapshot.page_count() > 0,
+            "VFS should contain real pages from the database"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_execute_serialization() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(ContentAddressedStore::new(&dir.path().join("obj"), 64).unwrap());
+        let vfs = Arc::new(CidVfs::with_default_page_size(store).unwrap());
+        let kp = NodeKeypair::generate();
+        let owner = kp.node_id();
+        let db = Arc::new(
+            CraftDatabase::create(owner, vfs, &dir.path().join("sql"))
+                .await
+                .unwrap(),
+        );
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", &owner)
+            .await
+            .unwrap();
+
+        // Launch two concurrent writes (T9: both should succeed without interleaving).
+        let db1 = Arc::clone(&db);
+        let db2 = Arc::clone(&db);
+        let h1 = tokio::spawn(async move {
+            db1.execute("INSERT INTO t VALUES (1, 'alpha')", &owner)
+                .await
+        });
+        let h2 = tokio::spawn(async move {
+            db2.execute("INSERT INTO t VALUES (2, 'beta')", &owner)
+                .await
+        });
+
+        h1.await.unwrap().unwrap();
+        h2.await.unwrap().unwrap();
+
+        // Both rows should be present.
+        let rows = db.query("SELECT id FROM t ORDER BY id").await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], ColumnValue::Integer(1));
+        assert_eq!(rows[1][0], ColumnValue::Integer(2));
+    }
+
+    #[tokio::test]
+    async fn execute_publishes_page_committed() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(ContentAddressedStore::new(&dir.path().join("obj"), 64).unwrap());
+        let vfs = Arc::new(CidVfs::with_default_page_size(store).unwrap());
+        let kp = NodeKeypair::generate();
+        let owner = kp.node_id();
+        let db = CraftDatabase::create(owner, vfs, &dir.path().join("sql"))
+            .await
+            .unwrap();
+
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        db.set_event_sender(tx);
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", &owner)
+            .await
+            .unwrap();
+
+        let event = rx.recv().await.unwrap();
+        match event {
+            craftec_types::Event::PageCommitted {
+                db_id, root_cid, ..
+            } => {
+                assert_eq!(db_id, db.db_id());
+                assert_eq!(root_cid, db.root_cid());
+            }
+            other => panic!("expected PageCommitted, got {:?}", other),
+        }
     }
 }

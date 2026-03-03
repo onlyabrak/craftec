@@ -91,11 +91,36 @@ impl EventBus {
         self.sender.subscribe()
     }
 
+    /// Return the raw broadcast sender for injection into subsystems.
+    ///
+    /// Subsystems that need to publish events (e.g. CraftOBJ, CraftSQL) can
+    /// hold a clone of this sender without depending on the full `EventBus`.
+    pub fn sender(&self) -> broadcast::Sender<Event> {
+        self.sender.clone()
+    }
+
     /// Return the number of active receivers on this bus.
     ///
     /// Useful for diagnostics and health checks.
     #[allow(dead_code)]
     pub fn receiver_count(&self) -> usize {
         self.sender.receiver_count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use craftec_types::Cid;
+
+    #[tokio::test]
+    async fn sender_returns_working_sender() {
+        let bus = EventBus::new(16);
+        let mut rx = bus.subscribe();
+        let tx = bus.sender();
+        let cid = Cid::from_data(b"test");
+        let _ = tx.send(Event::CidWritten { cid });
+        let event = rx.recv().await.unwrap();
+        assert!(matches!(event, Event::CidWritten { .. }));
     }
 }

@@ -10,6 +10,7 @@ pub mod cid;
 pub mod config;
 pub mod error;
 pub mod event;
+pub mod hlc;
 pub mod identity;
 pub mod piece;
 pub mod wire;

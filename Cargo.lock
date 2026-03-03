@@ -743,7 +743,6 @@ dependencies = [
 name = "craftec-sql"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "craftec-crypto",
  "craftec-obj",
  "craftec-types",

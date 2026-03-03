@@ -67,6 +67,7 @@ use craftec_vfs::CidVfs;
 use crate::event_bus::EventBus;
 use crate::handler::NodeMessageHandler;
 use crate::pending::PendingFetches;
+use crate::piece_store::CodedPieceIndex;
 use crate::shutdown::wait_for_shutdown;
 
 /// LRU cache capacity for the CraftOBJ content-addressed store.
@@ -120,6 +121,8 @@ pub struct CraftecNode {
     com_runtime: Arc<ComRuntime>,
     /// Kernel-level WASM program lifecycle manager.
     scheduler: Arc<ProgramScheduler>,
+    /// Maps content CIDs to their RLNC coded-piece CIDs.
+    piece_index: Arc<CodedPieceIndex>,
     /// Internal publish-subscribe event bus.
     event_bus: Arc<EventBus>,
     /// Broadcast sender used to trigger graceful shutdown in background tasks.
@@ -196,9 +199,13 @@ impl CraftecNode {
         // ── Step 6b: Initialize CraftSQL database ────────────────────────
         tracing::info!("Step 6b: initializing CraftSQL database...");
         let database = Arc::new(
-            CraftDatabase::create(keystore.node_id(), Arc::clone(&vfs))
-                .await
-                .context("failed to initialise CraftDatabase")?,
+            CraftDatabase::create(
+                keystore.node_id(),
+                Arc::clone(&vfs),
+                &config.data_dir.join("sql"),
+            )
+            .await
+            .context("failed to initialise CraftDatabase")?,
         );
         let rpc_write_handler = Arc::new(RpcWriteHandler::new(Arc::clone(&database)));
         tracing::info!(
@@ -217,6 +224,11 @@ impl CraftecNode {
         // ── Step 8: Initialize Event Bus ─────────────────────────────────────
         tracing::info!("Step 8: initializing event bus...");
         let event_bus = Arc::new(EventBus::new(EVENT_BUS_CAPACITY));
+
+        // Wire event publishers into subsystems created before the bus.
+        store.set_event_sender(event_bus.sender());
+        database.set_event_sender(event_bus.sender());
+
         tracing::info!(capacity = EVENT_BUS_CAPACITY, "Event bus ready");
 
         // ── Step 9: Initialize iroh Endpoint ─────────────────────────────────
@@ -270,9 +282,21 @@ impl CraftecNode {
             "HealthScanner and PieceTracker ready"
         );
 
+        // ── Step 11b: Initialize CodedPieceIndex ──────────────────────────────
+        let piece_index = Arc::new(CodedPieceIndex::new());
+        tracing::info!("CodedPieceIndex ready");
+
         // ── Step 12: Initialize ProgramScheduler ─────────────────────────────
         tracing::info!("Step 12: initializing ProgramScheduler...");
-        let scheduler = Arc::new(ProgramScheduler::new(Arc::clone(&com_runtime)));
+        let scheduler_keystore = Arc::new(
+            KeyStore::new(&config.data_dir).context("failed to initialise scheduler KeyStore")?,
+        );
+        let scheduler = Arc::new(ProgramScheduler::new(
+            Arc::clone(&com_runtime),
+            Arc::clone(&store),
+            Some(Arc::clone(&database)),
+            scheduler_keystore,
+        ));
         tracing::info!("ProgramScheduler ready");
 
         // ── Shutdown channel ──────────────────────────────────────────────────
@@ -298,6 +322,7 @@ impl CraftecNode {
             pending_fetches,
             health_scanner,
             piece_tracker,
+            piece_index,
             com_runtime,
             scheduler,
             event_bus,
@@ -324,6 +349,9 @@ impl CraftecNode {
     pub async fn run(&self) -> Result<()> {
         tracing::info!("Starting Craftec node...");
 
+        // T15: collect all background tasks in a JoinSet for graceful shutdown.
+        let mut tasks = tokio::task::JoinSet::new();
+
         // ── Bootstrap ─────────────────────────────────────────────────────────
         tracing::info!(
             peers = self.config.bootstrap_peers.len(),
@@ -344,7 +372,7 @@ impl CraftecNode {
             let store = Arc::clone(&self.store);
             let endpoint = Arc::clone(&self.endpoint);
             let node_id = *self.endpoint.node_id();
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 match store.list_cids().await {
                     Ok(cids) => {
                         tracing::info!(
@@ -380,9 +408,10 @@ impl CraftecNode {
                 Arc::clone(&self.dht),
                 Arc::clone(&self.pending_fetches),
                 Arc::clone(&self.rpc_write_handler),
+                Arc::clone(&self.piece_index),
                 *self.endpoint.node_id(),
             ));
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 tracing::info!("Accept loop: starting...");
                 tokio::select! {
                     _ = endpoint.accept_loop(handler) => {
@@ -401,7 +430,7 @@ impl CraftecNode {
             let swim = Arc::clone(&self.swim);
             let endpoint = Arc::clone(&self.endpoint);
             let shutdown_rx = self.shutdown_tx.subscribe();
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 tracing::info!("SWIM loop: starting...");
                 run_swim_loop(swim, endpoint, shutdown_rx).await;
                 tracing::info!("SWIM loop: stopped");
@@ -416,7 +445,7 @@ impl CraftecNode {
             // Scanner task: emits RepairRequests into repair_tx.
             let health_scanner = Arc::clone(&self.health_scanner);
             let shutdown_rx = self.shutdown_tx.subscribe();
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 tracing::info!("Health scan loop: starting...");
                 health_scanner.run(repair_tx, shutdown_rx).await;
                 tracing::info!("Health scan loop: stopped");
@@ -430,7 +459,7 @@ impl CraftecNode {
                 Arc::clone(&self.pending_fetches),
             );
             let mut repair_shutdown = self.shutdown_tx.subscribe();
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 tracing::info!("Repair executor: starting...");
                 loop {
                     tokio::select! {
@@ -462,8 +491,11 @@ impl CraftecNode {
             let endpoint = Arc::clone(&self.endpoint);
             let piece_tracker = Arc::clone(&self.piece_tracker);
             let dht = Arc::clone(&self.dht);
+            let store = Arc::clone(&self.store);
+            let rlnc = Arc::clone(&self.rlnc);
+            let piece_index = Arc::clone(&self.piece_index);
             let node_id = *self.endpoint.node_id();
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 tracing::info!("Event dispatch loop: starting...");
                 loop {
                     tokio::select! {
@@ -473,9 +505,44 @@ impl CraftecNode {
                                     tracing::debug!(event = ?event, "Event bus dispatch");
                                     match event {
                                         craftec_types::Event::CidWritten { cid } => {
+                                            // DHT announce.
                                             craftec_net::dht::announce_cid_to_peers(
                                                 &cid, &node_id, &endpoint,
                                             ).await;
+
+                                            // Skip RLNC encoding for piece CIDs (prevent recursion).
+                                            if piece_index.is_piece_cid(&cid) {
+                                                continue;
+                                            }
+
+                                            // RLNC encode and store coded pieces.
+                                            if let Ok(Some(data)) = store.get(&cid).await {
+                                                let k = 32u32;
+                                                if let Ok(pieces) = rlnc.encode(&data, k).await {
+                                                    let mut pcids = Vec::new();
+                                                    for piece in &pieces {
+                                                        let bytes = postcard::to_allocvec(piece).unwrap_or_default();
+                                                        if let Ok(pcid) = store.put(&bytes).await {
+                                                            piece_index.mark_piece_cid(pcid);
+                                                            pcids.push(pcid);
+                                                            piece_tracker.record_piece(
+                                                                &cid,
+                                                                craftec_health::tracker::PieceHolder {
+                                                                    node_id,
+                                                                    piece_index: pcids.len() as u32 - 1,
+                                                                    last_seen: std::time::Instant::now(),
+                                                                },
+                                                            );
+                                                        }
+                                                    }
+                                                    piece_index.insert(cid, pcids);
+                                                    tracing::debug!(
+                                                        cid = %cid,
+                                                        pieces = pieces.len(),
+                                                        "RLNC: encoded and stored coded pieces"
+                                                    );
+                                                }
+                                            }
                                         }
                                         craftec_types::Event::PeerConnected { node_id } => {
                                             tracing::info!(peer = %node_id, "Event: peer connected");
@@ -542,7 +609,7 @@ impl CraftecNode {
         // ── Wait for shutdown signal ───────────────────────────────────────────
         wait_for_shutdown().await;
 
-        // ── Graceful shutdown sequence ─────────────────────────────────────────
+        // ── Graceful shutdown sequence (T15: JoinSet instead of fixed sleep) ───
         tracing::info!("Graceful shutdown initiated...");
 
         // Publish ShutdownSignal event to inform any event-bus subscribers.
@@ -552,8 +619,16 @@ impl CraftecNode {
         // Broadcast shutdown to all background tasks.
         let _ = self.shutdown_tx.send(());
 
-        // Brief yield to let tasks react to the shutdown signal.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Wait for all tasks to complete, with a 5-second timeout.
+        let shutdown_result = tokio::time::timeout(Duration::from_secs(5), async {
+            while tasks.join_next().await.is_some() {}
+        })
+        .await;
+
+        if shutdown_result.is_err() {
+            tracing::warn!("Graceful shutdown timed out after 5s — aborting remaining tasks");
+            tasks.abort_all();
+        }
 
         // Remove node.lock sentinel.
         let lock_path = self.config.data_dir.join(NODE_LOCK_FILENAME);

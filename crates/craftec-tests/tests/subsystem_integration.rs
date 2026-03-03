@@ -43,7 +43,7 @@ impl TestNode {
         let vfs = Arc::new(CidVfs::with_default_page_size(Arc::clone(&store)).unwrap());
         let keypair = NodeKeypair::generate();
         let database = Arc::new(
-            CraftDatabase::create(keypair.node_id(), Arc::clone(&vfs))
+            CraftDatabase::create(keypair.node_id(), Arc::clone(&vfs), &tmp.path().join("sql"))
                 .await
                 .unwrap(),
         );
