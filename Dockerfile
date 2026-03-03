@@ -1,11 +1,11 @@
 # Craftec Node — Multi-stage Docker build
 #
-# Build:   docker build -t craftec-node .
-# Run:     docker run -e CRAFTEC_DATA_DIR=/data -e CRAFTEC_LISTEN_PORT=4433 craftec-node
+# Build:   docker build -t craftec .
+# Run:     docker run -e CRAFTEC_DATA_DIR=/data -e CRAFTEC_LISTEN_PORT=4433 craftec
 
 # ── Stage 1: Build ───────────────────────────────────────────────────────────
 
-FROM rust:1.83-bookworm AS builder
+FROM rust:latest AS builder
 
 WORKDIR /build
 
@@ -14,8 +14,8 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 
 # Build in release mode.
-RUN cargo build --release --bin craftec-node \
-    && strip target/release/craftec-node
+RUN cargo build --release --bin craftec \
+    && strip target/release/craftec
 
 # ── Stage 2: Runtime ─────────────────────────────────────────────────────────
 
@@ -29,7 +29,7 @@ RUN apt-get update \
 RUN groupadd -r craftec && useradd -r -g craftec -m craftec
 
 # Copy the built binary.
-COPY --from=builder /build/target/release/craftec-node /usr/local/bin/craftec-node
+COPY --from=builder /build/target/release/craftec /usr/local/bin/craftec
 
 # Data directory (mount as volume for persistence).
 RUN mkdir -p /data && chown craftec:craftec /data
@@ -40,10 +40,11 @@ ENV CRAFTEC_DATA_DIR=/data
 ENV CRAFTEC_LISTEN_PORT=4433
 ENV RUST_LOG=info
 
-# Switch to non-root.
+# Switch to non-root and set working directory.
 USER craftec
+WORKDIR /data
 
 # Expose the default QUIC port.
 EXPOSE 4433/udp
 
-ENTRYPOINT ["craftec-node"]
+ENTRYPOINT ["craftec"]

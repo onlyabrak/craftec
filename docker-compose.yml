@@ -113,7 +113,7 @@ services:
         ipv4_address: 172.28.1.100
     volumes:
       - ./tests/docker:/tests:ro
-    entrypoint: ["bash", "/tests/run_all.sh"]
+    entrypoint: ["bash", "-c", "apt-get update -qq && apt-get install -y -qq iputils-ping > /dev/null 2>&1; bash /tests/run_all.sh"]
     depends_on:
       - node-1
       - node-2
