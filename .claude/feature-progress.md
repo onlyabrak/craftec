@@ -239,3 +239,28 @@
 - Replaced 500ms shutdown sleep with `join_set.shutdown()` + 5s timeout + abort_all fallback
 - 9 new tests (7 HLC unit + 2 wire framing v0/v1)
 - All 363 tests pass, clippy clean, fmt clean
+
+---
+
+## Deep Lifecycle Audit Remediation (C1–C7 + Logging + Docker)
+
+- [x] Phase 1: Periodic Pruning Tasks (C5, C6) — node.rs
+- [x] Phase 2: Adaptive SWIM Piggyback (C3) — swim.rs — 3 new tests
+- [x] Phase 3: Rate-Limited Storage Bootstrap (C4) — node.rs
+- [x] Phase 4: Variable-K Health Scanning (C7) — tracker.rs, scanner.rs, node.rs — 3 new tests
+- [x] Phase 5: RLNC Encode Off Event Loop (C1) — node.rs
+- [x] Phase 6: SQL Read/Write Connection Separation (C2) — database.rs — 1 new test
+- [x] Phase 7: Verbose Structured Logging (Part D) — store.rs, database.rs, rpc_write.rs, swim.rs, engine.rs, scanner.rs, scheduler.rs, node.rs
+- [x] Phase 8: Docker Multi-Node Test Infrastructure (Part E) — Dockerfile, docker-compose.yml, tests/docker/run_all.sh, main.rs env overrides
+
+### Deep Lifecycle Audit Notes
+- 370 tests pass (363 + 7 new), 0 failures
+- clippy clean, fmt clean
+- New tests: adaptive_piggyback_count_small_cluster, adaptive_piggyback_count_large_cluster, alive_count_accuracy, record_and_get_k, record_k_first_writer_wins, remove_node_cleans_k_values, concurrent_read_during_write
+
+### Post-Review Bug Fixes
+- [x] Fix race condition: pre-compute CID and mark_piece_cid BEFORE store.put fires CidWritten (node.rs)
+- [x] Fix missing busy_timeout on write_conn — added PRAGMA busy_timeout = 5000 (database.rs)
+- [x] Fix SWIM probe nonce mismatch — extract nonce from message instead of allocating new one (swim.rs)
+- [x] Fix indirect probe sending to target instead of delegates (swim.rs)
+- [x] Fix unwrap_or_default on postcard serialization — proper error handling with skip (node.rs)

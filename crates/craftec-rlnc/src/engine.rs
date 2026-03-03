@@ -144,7 +144,9 @@ impl RlncEngine {
     /// Propagates any error from [`RlncEncoder::new`].
     pub async fn encode(&self, data: &[u8], k: u32) -> Result<Vec<CodedPiece>> {
         let _permit = self.acquire().await?;
+        tracing::debug!(data_size = data.len(), k, "RLNC: encode start");
 
+        let start = std::time::Instant::now();
         let encoder = RlncEncoder::new(data, k)?;
         let n = encoder.target_pieces() as usize;
         let result = encoder.encode_n(n);
@@ -154,10 +156,10 @@ impl RlncEngine {
             .encode_bytes
             .fetch_add(data.len() as u64, Ordering::Relaxed);
 
-        info!(
-            size = data.len(),
+        tracing::debug!(
             pieces = result.len(),
-            k = k,
+            duration_ms = start.elapsed().as_millis() as u64,
+            k,
             "RLNC: encode complete"
         );
 
@@ -186,7 +188,9 @@ impl RlncEngine {
         pieces: &[CodedPiece],
     ) -> Result<Vec<u8>> {
         let _permit = self.acquire().await?;
+        tracing::debug!(pieces_available = pieces.len(), k, "RLNC: decode start");
 
+        let start = std::time::Instant::now();
         let mut decoder = RlncDecoder::new(k, piece_size);
         for piece in pieces {
             match decoder.add_piece(piece) {
@@ -205,14 +209,20 @@ impl RlncEngine {
             }
         }
 
-        let result = decoder.decode()?;
+        let result = match decoder.decode() {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::error!(reason = %e, k, "RLNC: decode failure");
+                return Err(e);
+            }
+        };
 
         self.metrics.decodes.fetch_add(1, Ordering::Relaxed);
 
-        info!(
-            k = k,
-            pieces_used = pieces.len(),
-            bytes = result.len(),
+        tracing::debug!(
+            data_size = result.len(),
+            duration_ms = start.elapsed().as_millis() as u64,
+            k,
             "RLNC: decode complete"
         );
 

@@ -108,6 +108,7 @@ impl HealthScanner {
     /// them starting from the saved cursor position, checks each one, and advances
     /// the cursor for the next call.
     pub async fn scan_cycle(&self) -> Result<Vec<RepairRequest>> {
+        let cycle_start = std::time::Instant::now();
         // Fetch the sorted CID list from the piece tracker (canonical source of known CIDs).
         let all_cids = self.piece_tracker.sorted_cids();
 
@@ -137,6 +138,13 @@ impl HealthScanner {
         self.last_scan_index
             .store((start + batch_size) % total, Ordering::Release);
 
+        tracing::trace!(
+            cursor = start,
+            batch_size,
+            total_cids = total,
+            "HealthScan: cycle start"
+        );
+
         // Evaluate each CID in the batch.
         let mut repairs = Vec::new();
 
@@ -150,6 +158,7 @@ impl HealthScanner {
             scanned = batch.len() + wrapped.len(),
             repairs = repairs.len(),
             cursor = start,
+            duration_ms = cycle_start.elapsed().as_millis() as u64,
             "HealthScan: cycle complete"
         );
 
@@ -209,7 +218,7 @@ impl HealthScanner {
     /// Evaluate a single CID and return a [`RepairRequest`] if repair is needed.
     fn evaluate_cid(&self, cid: &craftec_types::Cid) -> Option<RepairRequest> {
         let available = self.piece_tracker.available_count(cid);
-        let k = DEFAULT_K;
+        let k = self.piece_tracker.get_k(cid).unwrap_or(DEFAULT_K);
         let target = target_piece_count(k);
 
         if available < k {

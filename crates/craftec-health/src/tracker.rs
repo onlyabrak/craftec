@@ -45,6 +45,9 @@ pub struct PieceHolder {
 pub struct PieceTracker {
     /// `Cid` → list of (node, piece_index) records.
     availability: Arc<DashMap<Cid, Vec<PieceHolder>>>,
+    /// `Cid` → K value used for RLNC encoding (C7: variable-K support).
+    /// First-writer-wins: once set, the K value for a CID is immutable.
+    k_values: Arc<DashMap<Cid, u32>>,
 }
 
 impl PieceTracker {
@@ -102,20 +105,44 @@ impl PieceTracker {
             .unwrap_or(0)
     }
 
+    /// Record the K value used for RLNC encoding of `cid`.
+    ///
+    /// Uses first-writer-wins semantics: once a K value is recorded for a CID,
+    /// subsequent calls with a different K are silently ignored.
+    pub fn record_k(&self, cid: &Cid, k: u32) {
+        self.k_values.entry(*cid).or_insert(k);
+    }
+
+    /// Return the recorded K value for `cid`, if any.
+    pub fn get_k(&self, cid: &Cid) -> Option<u32> {
+        self.k_values.get(cid).map(|v| *v)
+    }
+
     /// Remove all piece records for `node_id` across every tracked CID.
     ///
     /// Call this when SWIM declares a node dead or when it gracefully departs.
+    /// Also cleans up K values for CIDs that no longer have any holders.
     pub fn remove_node(&self, node_id: &NodeId) {
         let mut removed = 0usize;
-        self.availability.retain(|_cid, holders| {
+        let mut emptied_cids = Vec::new();
+        self.availability.retain(|cid, holders| {
             let before = holders.len();
             holders.retain(|h| &h.node_id != node_id);
             removed += before - holders.len();
-            !holders.is_empty() // Drop empty CID entries.
+            let keep = !holders.is_empty();
+            if !keep {
+                emptied_cids.push(*cid);
+            }
+            keep
         });
+        // Clean up K values for CIDs with no remaining holders (C7).
+        for cid in &emptied_cids {
+            self.k_values.remove(cid);
+        }
         tracing::debug!(
             node = %node_id,
             records_removed = removed,
+            k_values_cleaned = emptied_cids.len(),
             "PieceTracker: node removed"
         );
     }
@@ -285,6 +312,37 @@ mod tests {
         for window in sorted.windows(2) {
             assert!(window[0].as_bytes() <= window[1].as_bytes());
         }
+    }
+
+    #[test]
+    fn record_and_get_k() {
+        let tracker = PieceTracker::new();
+        let cid = Cid::from_data(b"k-test");
+        tracker.record_k(&cid, 16);
+        assert_eq!(tracker.get_k(&cid), Some(16));
+    }
+
+    #[test]
+    fn record_k_first_writer_wins() {
+        let tracker = PieceTracker::new();
+        let cid = Cid::from_data(b"k-first-write");
+        tracker.record_k(&cid, 8);
+        tracker.record_k(&cid, 32);
+        assert_eq!(tracker.get_k(&cid), Some(8));
+    }
+
+    #[test]
+    fn remove_node_cleans_k_values() {
+        let tracker = PieceTracker::new();
+        let cid = Cid::from_data(b"k-cleanup");
+        let node = NodeId::generate();
+        tracker.record_piece(&cid, holder(node, 0));
+        tracker.record_k(&cid, 16);
+
+        // After removing the only holder, K value should be cleaned up.
+        tracker.remove_node(&node);
+        assert_eq!(tracker.cid_count(), 0);
+        assert_eq!(tracker.get_k(&cid), None);
     }
 
     #[test]

@@ -206,6 +206,7 @@ impl ContentAddressedStore {
     /// - [`ObjError::StoreFull`] if the filesystem has no space.
     /// - [`ObjError::IoError`] on other I/O failures.
     pub async fn put(&self, data: &[u8]) -> Result<Cid> {
+        let put_start = std::time::Instant::now();
         let cid = Cid::from_data(data);
         self.inner.metrics.puts.fetch_add(1, Ordering::Relaxed);
 
@@ -251,7 +252,12 @@ impl ContentAddressedStore {
             let _ = tx.send(craftec_types::Event::CidWritten { cid });
         }
 
-        trace!(cid = %cid, size = data.len(), "CraftOBJ: put object — write complete");
+        trace!(
+            cid = %cid,
+            size = data.len(),
+            duration_ms = put_start.elapsed().as_millis() as u64,
+            "CraftOBJ: put object — write complete"
+        );
         Ok(cid)
     }
 
@@ -279,6 +285,7 @@ impl ContentAddressedStore {
     /// - `Ok(None)` — object is not present in this store.
     /// - `Err(ObjError::IntegrityViolation)` — object found but corrupted.
     pub async fn get(&self, cid: &Cid) -> Result<Option<Bytes>> {
+        let get_start = std::time::Instant::now();
         self.inner.metrics.gets.fetch_add(1, Ordering::Relaxed);
 
         // Layer 1: LRU cache.
@@ -298,7 +305,7 @@ impl ContentAddressedStore {
 
         // Layer 2: Bloom filter.
         if !self.inner.bloom.read().probably_contains(cid) {
-            debug!(cid = %cid, cache_hit = false, "CraftOBJ: get object — bloom miss, returning None");
+            debug!(cid = %cid, layer = "bloom", "CraftOBJ: get — bloom miss, returning None");
             return Ok(None);
         }
 
@@ -342,7 +349,12 @@ impl ContentAddressedStore {
         // Populate LRU cache for subsequent reads.
         self.inner.cache.put(*cid, bytes.clone());
 
-        debug!(cid = %cid, cache_hit = false, "CraftOBJ: get object");
+        debug!(
+            cid = %cid,
+            layer = "disk",
+            duration_ms = get_start.elapsed().as_millis() as u64,
+            "CraftOBJ: get object — disk read"
+        );
         Ok(Some(bytes))
     }
 

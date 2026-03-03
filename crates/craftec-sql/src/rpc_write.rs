@@ -70,8 +70,23 @@ impl RpcWriteHandler {
             sql: msg.sql.clone(),
             expected_root: msg.expected_root,
         };
-        check_ownership(&ctx, self.database.owner())?;
-        check_cas(&ctx, Some(self.database.root_cid()))?;
+        if let Err(e) = check_ownership(&ctx, self.database.owner()) {
+            tracing::warn!(
+                writer = %msg.writer,
+                owner = %self.database.owner(),
+                "CraftSQL RPC: ownership check rejected"
+            );
+            return Err(e);
+        }
+        if let Err(e) = check_cas(&ctx, Some(self.database.root_cid())) {
+            tracing::warn!(
+                writer = %msg.writer,
+                expected_root = ?msg.expected_root,
+                actual_root = %self.database.root_cid(),
+                "CraftSQL RPC: CAS conflict"
+            );
+            return Err(e);
+        }
 
         // Step 4: execute the mutation.
         self.database.execute(&msg.sql, &msg.writer).await?;

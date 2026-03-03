@@ -42,8 +42,9 @@ async fn main() -> Result<()> {
     init_tracing();
     tracing::info!("Craftec node starting...");
 
-    // 2. Load configuration
+    // 2. Load configuration (with Docker env var overrides)
     let config = load_or_create_config()?;
+    let config = apply_env_overrides(config);
     tracing::info!(
         data_dir = %config.data_dir.display(),
         port = config.listen_port,
@@ -74,6 +75,39 @@ fn init_tracing() {
         .with_file(true)
         .with_line_number(true)
         .init();
+}
+
+/// Apply environment variable overrides to the configuration.
+///
+/// Supported variables:
+/// - `CRAFTEC_DATA_DIR` → overrides `config.data_dir`
+/// - `CRAFTEC_LISTEN_PORT` → overrides `config.listen_port`
+/// - `CRAFTEC_BOOTSTRAP_PEERS` → overrides `config.bootstrap_peers` (comma-separated)
+fn apply_env_overrides(
+    mut config: craftec_types::config::NodeConfig,
+) -> craftec_types::config::NodeConfig {
+    if let Ok(dir) = std::env::var("CRAFTEC_DATA_DIR") {
+        tracing::info!(data_dir = %dir, "Env override: CRAFTEC_DATA_DIR");
+        config.data_dir = std::path::PathBuf::from(dir);
+    }
+    if let Ok(port_str) = std::env::var("CRAFTEC_LISTEN_PORT") {
+        if let Ok(port) = port_str.parse::<u16>() {
+            tracing::info!(port, "Env override: CRAFTEC_LISTEN_PORT");
+            config.listen_port = port;
+        } else {
+            tracing::warn!(value = %port_str, "CRAFTEC_LISTEN_PORT: invalid port number");
+        }
+    }
+    if let Ok(peers_str) = std::env::var("CRAFTEC_BOOTSTRAP_PEERS") {
+        let peers: Vec<String> = peers_str
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        tracing::info!(count = peers.len(), "Env override: CRAFTEC_BOOTSTRAP_PEERS");
+        config.bootstrap_peers = peers;
+    }
+    config
 }
 
 /// Load node configuration from `craftec.json`, or create a default if absent.

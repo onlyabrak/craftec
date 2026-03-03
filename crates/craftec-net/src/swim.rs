@@ -45,6 +45,21 @@ use craftec_types::{NodeId, WireMessage};
 /// Default time before a `Suspect` node is declared `Dead` (spec §18: 5 seconds).
 const DEFAULT_SUSPECT_TIMEOUT: Duration = Duration::from_millis(5000);
 
+/// Compute the adaptive piggyback gossip count for a cluster of `n` alive members.
+///
+/// Returns `max(4, ceil(log2(n)))` — ensures a minimum of 4 gossip updates per ping
+/// for small clusters, scaling logarithmically for larger clusters.
+pub fn adaptive_piggyback_count(n: usize) -> usize {
+    if n <= 16 {
+        4
+    } else {
+        // ceil(log2(n)): use (usize::BITS - leading_zeros - 1) and add 1 if not a power of 2.
+        let log2 = (usize::BITS - n.leading_zeros() - 1) as usize;
+        let ceil_log2 = if n.is_power_of_two() { log2 } else { log2 + 1 };
+        ceil_log2.max(4)
+    }
+}
+
 /// Default protocol tick period — one random peer is probed per tick (§13).
 const DEFAULT_PROTOCOL_PERIOD: Duration = Duration::from_millis(500);
 
@@ -102,6 +117,8 @@ pub struct SwimMembership {
     probe_nonce: AtomicU64,
     /// Pending probe acks keyed by nonce.
     pending_probes: DashMap<u64, oneshot::Sender<u64>>,
+    /// Monotonic tick counter for periodic membership summaries (C3).
+    tick_count: AtomicU64,
 }
 
 impl SwimMembership {
@@ -124,6 +141,7 @@ impl SwimMembership {
             probe_index: AtomicUsize::new(0),
             probe_nonce: AtomicU64::new(0),
             pending_probes: DashMap::new(),
+            tick_count: AtomicU64::new(0),
         }
     }
 
@@ -143,6 +161,14 @@ impl SwimMembership {
     /// Return the total number of known members (all states).
     pub fn member_count(&self) -> usize {
         self.members.len()
+    }
+
+    /// Return the number of members currently in the `Alive` state.
+    pub fn alive_count(&self) -> usize {
+        self.members
+            .iter()
+            .filter(|e| matches!(e.value(), MemberState::Alive { .. }))
+            .count()
     }
 
     /// Return `true` if `node_id` is currently in the `Alive` state.
@@ -273,6 +299,7 @@ impl SwimMembership {
     /// Returns `true` if the probe was still pending.
     pub fn resolve_probe(&self, nonce: u64, incarnation: u64) -> bool {
         if let Some((_, tx)) = self.pending_probes.remove(&nonce) {
+            tracing::debug!(nonce, incarnation, "SWIM: probe ack resolved");
             let _ = tx.send(incarnation);
             true
         } else {
@@ -463,23 +490,36 @@ impl SwimMembership {
 
         // Step 2: select probe target.
         let alive = self.alive_members();
+        let alive_len = alive.len();
+
+        // Increment tick counter and log membership summary every 10 ticks.
+        let tick = self.tick_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if tick.is_multiple_of(10) {
+            tracing::debug!(
+                tick,
+                alive = alive_len,
+                total = self.member_count(),
+                "SWIM: membership summary"
+            );
+        }
+
         tracing::trace!(
-            alive = alive.len(),
+            alive = alive_len,
             "SWIM: protocol tick, {} alive members",
-            alive.len()
+            alive_len
         );
 
         if alive.is_empty() {
             return Vec::new();
         }
 
-        let idx = self.probe_index.fetch_add(1, Ordering::Relaxed) % alive.len();
+        let idx = self.probe_index.fetch_add(1, Ordering::Relaxed) % alive_len;
         let target = alive[idx];
 
         // Step 3: build ping with piggybacked membership state.
-        // Piggybacked updates are plain SwimAlive/SwimSuspect/SwimDead messages
-        // so the wire format doesn't require MemberState in craftec-types.
-        let piggyback = self.collect_gossip_msgs(4); // up to 4 updates piggybacked
+        // Adaptive gossip count: max(4, ceil(log2(n))) for cluster scalability (C3).
+        let gossip_count = adaptive_piggyback_count(alive_len);
+        let piggyback = self.collect_gossip_msgs(gossip_count);
 
         // Allocate a nonce for probe-ack correlation (T2).
         let nonce = self.probe_nonce.fetch_add(1, Ordering::Relaxed);
@@ -594,10 +634,18 @@ async fn probe_with_ack(
     target: NodeId,
     msg: WireMessage,
 ) {
-    // Step 1: Register the probe and send the ping.
-    let (nonce, rx) = swim.register_probe();
+    // Step 1: Extract nonce from the already-built SwimPing and register a
+    // probe receiver under THAT nonce (not a freshly allocated one).
+    let nonce = match &msg {
+        WireMessage::SwimPing { nonce, .. } => *nonce,
+        _ => return,
+    };
+    let (tx, rx) = oneshot::channel();
+    swim.pending_probes.insert(nonce, tx);
+    tracing::debug!(target = %target, nonce, "SWIM: probe sent");
 
     if let Err(e) = endpoint.send_message(&target, &msg).await {
+        swim.pending_probes.remove(&nonce);
         tracing::debug!(peer = %target, error = %e, "SWIM: failed to send probe");
         return;
     }
@@ -631,11 +679,13 @@ async fn probe_with_ack(
         piggyback,
     };
 
-    for _delegate in &delegates {
-        // Send the ping directly to target through each delegate's path.
-        // Future: replace with a proper PingReq relay message.
+    for delegate in &delegates {
+        // Send the probe to each delegate. Without a PingReq relay message,
+        // delegates respond with their own ack (confirming they are reachable)
+        // but cannot relay to the target. Still useful for redundant liveness
+        // checks. Future: implement proper PingReq relay for true SWIM indirect.
         let ep = Arc::clone(&endpoint);
-        let t = target;
+        let t = *delegate;
         let m = indirect_ping.clone();
         tokio::spawn(async move {
             let _ = ep.send_message(&t, &m).await;
@@ -648,7 +698,7 @@ async fn probe_with_ack(
             tracing::trace!(peer = %target, "SWIM: indirect probe ack received");
         }
         _ => {
-            tracing::info!(peer = %target, "SWIM: all probes timed out — marking suspect");
+            tracing::warn!(target = %target, nonce = indirect_nonce, "SWIM: all probes timed out — marking suspect");
             let inc = swim.last_known_incarnation(&target);
             swim.mark_suspect(&target, inc);
         }
@@ -819,6 +869,40 @@ mod tests {
         assert_eq!(swim.protocol_period, Duration::from_millis(500));
         // T8: spec §18 requires 5000ms suspect timeout.
         assert_eq!(swim.suspect_timeout, Duration::from_millis(5000));
+    }
+
+    #[test]
+    fn adaptive_piggyback_count_small_cluster() {
+        // Values 0–16 all return 4.
+        for n in 0..=16 {
+            assert_eq!(super::adaptive_piggyback_count(n), 4, "n={n}");
+        }
+    }
+
+    #[test]
+    fn adaptive_piggyback_count_large_cluster() {
+        assert_eq!(super::adaptive_piggyback_count(32), 5);
+        assert_eq!(super::adaptive_piggyback_count(64), 6);
+        assert_eq!(super::adaptive_piggyback_count(1000), 10);
+    }
+
+    #[test]
+    fn alive_count_accuracy() {
+        let swim = make_swim();
+        let p1 = NodeId::generate();
+        let p2 = NodeId::generate();
+        let p3 = NodeId::generate();
+
+        swim.mark_alive(&p1, 0);
+        swim.mark_alive(&p2, 0);
+        swim.mark_alive(&p3, 0);
+        assert_eq!(swim.alive_count(), 3);
+
+        swim.mark_suspect(&p2, 0);
+        assert_eq!(swim.alive_count(), 2);
+
+        swim.mark_dead(&p3, 0);
+        assert_eq!(swim.alive_count(), 1);
     }
 
     #[test]

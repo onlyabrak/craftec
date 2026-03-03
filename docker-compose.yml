@@ -1,0 +1,129 @@
+# Craftec Node — Multi-node test cluster
+#
+# Usage:
+#   docker compose up -d           # start 5-node cluster
+#   docker compose logs -f node-1  # follow seed node logs
+#   docker compose down -v         # stop and remove volumes
+
+networks:
+  craftec:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+services:
+  # ── Seed node (node-1) ──────────────────────────────────────────────────
+  node-1:
+    build: .
+    container_name: craftec-node-1
+    hostname: node-1
+    networks:
+      craftec:
+        ipv4_address: 172.28.1.1
+    environment:
+      CRAFTEC_DATA_DIR: /data
+      CRAFTEC_LISTEN_PORT: "4433"
+      CRAFTEC_BOOTSTRAP_PEERS: ""
+      RUST_LOG: info,craftec=debug
+    volumes:
+      - node1-data:/data
+    ports:
+      - "4433:4433/udp"
+
+  # ── Node 2 ──────────────────────────────────────────────────────────────
+  node-2:
+    build: .
+    container_name: craftec-node-2
+    hostname: node-2
+    networks:
+      craftec:
+        ipv4_address: 172.28.1.2
+    environment:
+      CRAFTEC_DATA_DIR: /data
+      CRAFTEC_LISTEN_PORT: "4433"
+      CRAFTEC_BOOTSTRAP_PEERS: "172.28.1.1:4433"
+      RUST_LOG: info,craftec=debug
+    volumes:
+      - node2-data:/data
+    depends_on:
+      - node-1
+
+  # ── Node 3 ──────────────────────────────────────────────────────────────
+  node-3:
+    build: .
+    container_name: craftec-node-3
+    hostname: node-3
+    networks:
+      craftec:
+        ipv4_address: 172.28.1.3
+    environment:
+      CRAFTEC_DATA_DIR: /data
+      CRAFTEC_LISTEN_PORT: "4433"
+      CRAFTEC_BOOTSTRAP_PEERS: "172.28.1.1:4433"
+      RUST_LOG: info,craftec=debug
+    volumes:
+      - node3-data:/data
+    depends_on:
+      - node-1
+
+  # ── Node 4 ──────────────────────────────────────────────────────────────
+  node-4:
+    build: .
+    container_name: craftec-node-4
+    hostname: node-4
+    networks:
+      craftec:
+        ipv4_address: 172.28.1.4
+    environment:
+      CRAFTEC_DATA_DIR: /data
+      CRAFTEC_LISTEN_PORT: "4433"
+      CRAFTEC_BOOTSTRAP_PEERS: "172.28.1.1:4433"
+      RUST_LOG: info,craftec=debug
+    volumes:
+      - node4-data:/data
+    depends_on:
+      - node-1
+
+  # ── Node 5 ──────────────────────────────────────────────────────────────
+  node-5:
+    build: .
+    container_name: craftec-node-5
+    hostname: node-5
+    networks:
+      craftec:
+        ipv4_address: 172.28.1.5
+    environment:
+      CRAFTEC_DATA_DIR: /data
+      CRAFTEC_LISTEN_PORT: "4433"
+      CRAFTEC_BOOTSTRAP_PEERS: "172.28.1.1:4433"
+      RUST_LOG: info,craftec=debug
+    volumes:
+      - node5-data:/data
+    depends_on:
+      - node-1
+
+  # ── Test runner ─────────────────────────────────────────────────────────
+  test-runner:
+    image: debian:bookworm-slim
+    container_name: craftec-test-runner
+    hostname: test-runner
+    networks:
+      craftec:
+        ipv4_address: 172.28.1.100
+    volumes:
+      - ./tests/docker:/tests:ro
+    entrypoint: ["bash", "/tests/run_all.sh"]
+    depends_on:
+      - node-1
+      - node-2
+      - node-3
+      - node-4
+      - node-5
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+  node4-data:
+  node5-data:

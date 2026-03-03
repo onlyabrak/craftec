@@ -141,6 +141,8 @@ impl CraftecNode {
     /// Returns an error if any subsystem fails to initialise (missing
     /// permissions, corrupt key file, unsupported Wasmtime configuration, etc.).
     pub async fn new(config: NodeConfig) -> Result<Self> {
+        let init_start = std::time::Instant::now();
+
         // ── Step 1: Create / verify data directory ───────────────────────────
         tracing::info!("Step 1: creating/verifying data directory...");
         std::fs::create_dir_all(&config.data_dir).with_context(|| {
@@ -305,6 +307,7 @@ impl CraftecNode {
         tracing::info!(
             node_id = %keystore.node_id(),
             listen_port = config.listen_port,
+            total_init_ms = init_start.elapsed().as_millis() as u64,
             "All subsystems initialised — node ready to start"
         );
 
@@ -367,23 +370,52 @@ impl CraftecNode {
             tracing::info!("No bootstrap peers configured — starting in isolated mode");
         }
 
-        // ── Storage bootstrap: announce locally-held CIDs to DHT ──────────────
+        // ── Storage bootstrap: announce locally-held CIDs to DHT (C4: rate-limited) ──
         {
+            const STORAGE_BOOTSTRAP_BATCH_SIZE: usize = 100;
             let store = Arc::clone(&self.store);
             let endpoint = Arc::clone(&self.endpoint);
             let node_id = *self.endpoint.node_id();
+            let mut shutdown_rx = self.shutdown_tx.subscribe();
             tasks.spawn(async move {
                 match store.list_cids().await {
                     Ok(cids) => {
+                        let total = cids.len();
                         tracing::info!(
-                            count = cids.len(),
+                            count = total,
                             "Storage bootstrap: announcing locally-held CIDs"
                         );
-                        for cid in &cids {
-                            craftec_net::dht::announce_cid_to_peers(cid, &node_id, &endpoint).await;
+                        for (batch_idx, chunk) in
+                            cids.chunks(STORAGE_BOOTSTRAP_BATCH_SIZE).enumerate()
+                        {
+                            for cid in chunk {
+                                craftec_net::dht::announce_cid_to_peers(cid, &node_id, &endpoint)
+                                    .await;
+                            }
+                            let announced = (batch_idx + 1) * STORAGE_BOOTSTRAP_BATCH_SIZE;
+                            tracing::debug!(
+                                batch = batch_idx + 1,
+                                batch_size = chunk.len(),
+                                progress = format!("{}/{}", announced.min(total), total),
+                                "Storage bootstrap: batch announced"
+                            );
+                            // Rate limit: sleep between batches and check for shutdown.
+                            if announced < total {
+                                tokio::select! {
+                                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                                    _ = shutdown_rx.recv() => {
+                                        tracing::info!(
+                                            announced = announced.min(total),
+                                            total,
+                                            "Storage bootstrap: interrupted by shutdown"
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
                         }
                         tracing::info!(
-                            count = cids.len(),
+                            count = total,
                             "Storage bootstrap: CID announcements complete"
                         );
                     }
@@ -511,37 +543,70 @@ impl CraftecNode {
                                             ).await;
 
                                             // Skip RLNC encoding for piece CIDs (prevent recursion).
-                                            if piece_index.is_piece_cid(&cid) {
+                                            let rlnc_triggered = !piece_index.is_piece_cid(&cid);
+                                            tracing::debug!(
+                                                cid = %cid,
+                                                rlnc_triggered,
+                                                "Event: CidWritten dispatched"
+                                            );
+                                            if !rlnc_triggered {
                                                 continue;
                                             }
 
-                                            // RLNC encode and store coded pieces.
-                                            if let Ok(Some(data)) = store.get(&cid).await {
-                                                let k = 32u32;
-                                                if let Ok(pieces) = rlnc.encode(&data, k).await {
-                                                    let mut pcids = Vec::new();
-                                                    for piece in &pieces {
-                                                        let bytes = postcard::to_allocvec(piece).unwrap_or_default();
-                                                        if let Ok(pcid) = store.put(&bytes).await {
-                                                            piece_index.mark_piece_cid(pcid);
-                                                            pcids.push(pcid);
-                                                            piece_tracker.record_piece(
-                                                                &cid,
-                                                                craftec_health::tracker::PieceHolder {
-                                                                    node_id,
-                                                                    piece_index: pcids.len() as u32 - 1,
-                                                                    last_seen: std::time::Instant::now(),
-                                                                },
-                                                            );
+                                            // C1: RLNC encode off event loop — fire-and-forget spawn.
+                                            {
+                                                let store = Arc::clone(&store);
+                                                let rlnc = Arc::clone(&rlnc);
+                                                let piece_index = Arc::clone(&piece_index);
+                                                let piece_tracker = Arc::clone(&piece_tracker);
+                                                tokio::spawn(async move {
+                                                    if let Ok(Some(data)) = store.get(&cid).await {
+                                                        let k = 32u32;
+                                                        match rlnc.encode(&data, k).await {
+                                                            Ok(pieces) => {
+                                                                piece_tracker.record_k(&cid, k);
+                                                                let mut pcids = Vec::new();
+                                                                for piece in &pieces {
+                                                                    let bytes = match postcard::to_allocvec(piece) {
+                                                                        Ok(b) => b,
+                                                                        Err(e) => {
+                                                                            tracing::warn!(cid = %cid, error = %e, "RLNC: failed to serialize coded piece — skipping");
+                                                                            continue;
+                                                                        }
+                                                                    };
+                                                                    // Pre-compute CID and mark as piece BEFORE store.put fires CidWritten,
+                                                                    // preventing the event loop from recursively RLNC-encoding coded pieces.
+                                                                    let pcid = craftec_types::Cid::from_data(&bytes);
+                                                                    piece_index.mark_piece_cid(pcid);
+                                                                    if let Ok(pcid) = store.put(&bytes).await {
+                                                                        pcids.push(pcid);
+                                                                        piece_tracker.record_piece(
+                                                                            &cid,
+                                                                            craftec_health::tracker::PieceHolder {
+                                                                                node_id,
+                                                                                piece_index: pcids.len() as u32 - 1,
+                                                                                last_seen: std::time::Instant::now(),
+                                                                            },
+                                                                        );
+                                                                    }
+                                                                }
+                                                                piece_index.insert(cid, pcids.clone());
+                                                                tracing::debug!(
+                                                                    cid = %cid,
+                                                                    pieces = pieces.len(),
+                                                                    "RLNC: encoded and stored coded pieces"
+                                                                );
+                                                            }
+                                                            Err(e) => {
+                                                                tracing::warn!(
+                                                                    cid = %cid,
+                                                                    error = %e,
+                                                                    "RLNC: encoding failed"
+                                                                );
+                                                            }
                                                         }
                                                     }
-                                                    piece_index.insert(cid, pcids);
-                                                    tracing::debug!(
-                                                        cid = %cid,
-                                                        pieces = pieces.len(),
-                                                        "RLNC: encoded and stored coded pieces"
-                                                    );
-                                                }
+                                                });
                                             }
                                         }
                                         craftec_types::Event::PeerConnected { node_id } => {
@@ -600,6 +665,56 @@ impl CraftecNode {
         }
         tracing::info!("Event dispatch loop spawned");
 
+        // ── Spawn: PendingFetches pruning (C5) ─────────────────────────────────
+        {
+            let pending_fetches = Arc::clone(&self.pending_fetches);
+            let mut shutdown_rx = self.shutdown_tx.subscribe();
+            tasks.spawn(async move {
+                tracing::info!("PendingFetches pruner: starting...");
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(60)) => {
+                            let pruned = pending_fetches.prune_stale(Duration::from_secs(120));
+                            if pruned > 0 {
+                                tracing::debug!(pruned, "PendingFetches pruner: removed stale entries");
+                            }
+                        }
+                        _ = shutdown_rx.recv() => {
+                            tracing::info!("PendingFetches pruner: shutdown signal received");
+                            break;
+                        }
+                    }
+                }
+                tracing::info!("PendingFetches pruner: stopped");
+            });
+        }
+        tracing::info!("PendingFetches pruner spawned");
+
+        // ── Spawn: DHT provider pruning (C6) ───────────────────────────────────
+        {
+            let dht = Arc::clone(&self.dht);
+            let mut shutdown_rx = self.shutdown_tx.subscribe();
+            tasks.spawn(async move {
+                tracing::info!("DHT provider pruner: starting...");
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(60)) => {
+                            let pruned = dht.prune_stale(Duration::from_secs(300));
+                            if pruned > 0 {
+                                tracing::debug!(pruned, "DHT provider pruner: removed stale records");
+                            }
+                        }
+                        _ = shutdown_rx.recv() => {
+                            tracing::info!("DHT provider pruner: shutdown signal received");
+                            break;
+                        }
+                    }
+                }
+                tracing::info!("DHT provider pruner: stopped");
+            });
+        }
+        tracing::info!("DHT provider pruner spawned");
+
         tracing::info!(
             node_id = %self.keystore.node_id(),
             listen_port = self.config.listen_port,
@@ -610,6 +725,7 @@ impl CraftecNode {
         wait_for_shutdown().await;
 
         // ── Graceful shutdown sequence (T15: JoinSet instead of fixed sleep) ───
+        let shutdown_start = std::time::Instant::now();
         tracing::info!("Graceful shutdown initiated...");
 
         // Publish ShutdownSignal event to inform any event-bus subscribers.
@@ -644,7 +760,10 @@ impl CraftecNode {
             }
         }
 
-        tracing::info!("Graceful shutdown complete");
+        tracing::info!(
+            total_shutdown_ms = shutdown_start.elapsed().as_millis() as u64,
+            "Graceful shutdown complete"
+        );
         Ok(())
     }
 

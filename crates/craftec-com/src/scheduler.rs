@@ -299,15 +299,18 @@ impl ProgramScheduler {
                     }
                     Err(ComError::FuelExhausted { .. }) => {
                         // Fuel exhaustion is normal for long-running agents; fast restart.
+                        tracing::debug!(wasm_cid = %cid, "CraftCOM: fuel exhausted — fast restart");
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                     Err(e) => {
                         local_crash_count += 1;
                         crash_counts.insert(cid, local_crash_count);
 
+                        let backoff = Duration::from_secs(1u64 << local_crash_count.min(6));
                         tracing::warn!(
                             wasm_cid = %cid,
                             crash_count = local_crash_count,
+                            backoff_ms = backoff.as_millis() as u64,
                             error = %e,
                             "CraftCOM: program crashed"
                         );
@@ -331,8 +334,7 @@ impl ProgramScheduler {
                             break;
                         }
 
-                        // Exponential backoff: 2^crash_count seconds, max 64s.
-                        let backoff = Duration::from_secs(1u64 << local_crash_count.min(6));
+                        // Exponential backoff (already computed above).
                         tokio::time::sleep(backoff).await;
                     }
                 }

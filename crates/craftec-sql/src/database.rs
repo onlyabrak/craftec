@@ -129,9 +129,12 @@ pub struct CraftDatabase {
     db_path: PathBuf,
     /// File-backed libsql database (kept alive so the connection remains valid).
     _libsql_db: libsql::Database,
-    /// libsql connection for executing SQL.  Protected by a tokio Mutex for
+    /// libsql connection for SQL mutations.  Protected by a tokio Mutex for
     /// serial write access (single-writer model).
-    conn: tokio::sync::Mutex<libsql::Connection>,
+    write_conn: tokio::sync::Mutex<libsql::Connection>,
+    /// libsql connection for read-only queries.  Separate from write_conn so
+    /// reads don't block behind writes (C2 fix).
+    read_conn: tokio::sync::Mutex<libsql::Connection>,
     /// Optional event sender for publishing PageCommitted events.
     event_tx: RwLock<Option<tokio::sync::broadcast::Sender<craftec_types::Event>>>,
 }
@@ -164,32 +167,50 @@ impl CraftDatabase {
             .await
             .map_err(|e| SqlError::LibsqlError(e.to_string()))?;
 
-        let conn = libsql_db
+        // Create write connection and set PRAGMAs.
+        let write_conn = libsql_db
             .connect()
             .map_err(|e| SqlError::LibsqlError(e.to_string()))?;
 
         // Set PRAGMAs: page_size = 16384, journal_mode = DELETE (no WAL per spec §35).
         // Use query() because PRAGMAs return result rows (execute() rejects row-returning SQL).
-        conn.query("PRAGMA page_size = 16384", ())
+        write_conn
+            .query("PRAGMA page_size = 16384", ())
             .await
             .map_err(|e| SqlError::LibsqlError(e.to_string()))?;
-        conn.query("PRAGMA journal_mode = DELETE", ())
+        write_conn
+            .query("PRAGMA journal_mode = DELETE", ())
+            .await
+            .map_err(|e| SqlError::LibsqlError(e.to_string()))?;
+        write_conn
+            .query("PRAGMA busy_timeout = 5000", ())
             .await
             .map_err(|e| SqlError::LibsqlError(e.to_string()))?;
 
         // Force SQLite to write pages to disk so we can sync them to VFS.
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS _craftec_meta (key TEXT PRIMARY KEY, value TEXT)",
-            (),
-        )
-        .await
-        .map_err(|e| SqlError::LibsqlError(e.to_string()))?;
-        conn.execute(
-            "INSERT OR REPLACE INTO _craftec_meta VALUES ('version', '1')",
-            (),
-        )
-        .await
-        .map_err(|e| SqlError::LibsqlError(e.to_string()))?;
+        write_conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS _craftec_meta (key TEXT PRIMARY KEY, value TEXT)",
+                (),
+            )
+            .await
+            .map_err(|e| SqlError::LibsqlError(e.to_string()))?;
+        write_conn
+            .execute(
+                "INSERT OR REPLACE INTO _craftec_meta VALUES ('version', '1')",
+                (),
+            )
+            .await
+            .map_err(|e| SqlError::LibsqlError(e.to_string()))?;
+
+        // Create a separate read connection (C2: read/write separation).
+        let read_conn = libsql_db
+            .connect()
+            .map_err(|e| SqlError::LibsqlError(e.to_string()))?;
+        read_conn
+            .query("PRAGMA busy_timeout = 5000", ())
+            .await
+            .map_err(|e| SqlError::LibsqlError(e.to_string()))?;
 
         tracing::info!(
             owner = %owner,
@@ -208,7 +229,8 @@ impl CraftDatabase {
             root_cid: RwLock::new(root),
             db_path,
             _libsql_db: libsql_db,
-            conn: tokio::sync::Mutex::new(conn),
+            write_conn: tokio::sync::Mutex::new(write_conn),
+            read_conn: tokio::sync::Mutex::new(read_conn),
             event_tx: RwLock::new(None),
         })
     }
@@ -239,6 +261,7 @@ impl CraftDatabase {
         };
         check_ownership(&ctx, &self.owner)?;
 
+        let exec_start = std::time::Instant::now();
         tracing::debug!(
             db_id = %self.db_id,
             sql = sql,
@@ -246,9 +269,9 @@ impl CraftDatabase {
         );
 
         // Execute SQL through libsql.
-        // T9 fix: hold the conn mutex through the entire execute-commit cycle
+        // T9 fix: hold the write_conn mutex through the entire execute-commit cycle
         // to prevent concurrent writes from interleaving VFS operations.
-        let conn = self.conn.lock().await;
+        let conn = self.write_conn.lock().await;
         conn.execute(sql, ())
             .await
             .map_err(|e| SqlError::SqlSyntaxError(e.to_string()))?;
@@ -272,6 +295,7 @@ impl CraftDatabase {
         tracing::debug!(
             db_id = %self.db_id,
             new_root = %new_root,
+            duration_ms = exec_start.elapsed().as_millis() as u64,
             "CraftSQL: execute committed",
         );
 
@@ -291,9 +315,17 @@ impl CraftDatabase {
     /// - [`SqlError::SqlSyntaxError`] if the SQL is invalid.
     /// - [`SqlError::VfsError`] on storage failure.
     pub async fn query(&self, sql: &str) -> Result<Vec<Row>> {
+        let query_start = std::time::Instant::now();
+        let sql_preview: String = sql.chars().take(100).collect();
+        tracing::debug!(
+            db_id = %self.db_id,
+            sql_preview = %sql_preview,
+            "CraftSQL: query start",
+        );
+
         let _snapshot = self.vfs.snapshot().map_err(SqlError::VfsError)?;
 
-        let conn = self.conn.lock().await;
+        let conn = self.read_conn.lock().await;
         let mut rows_result = conn
             .query(sql, ())
             .await
@@ -318,9 +350,9 @@ impl CraftDatabase {
 
         tracing::debug!(
             db_id = %self.db_id,
-            sql = sql,
-            rows = result.len(),
-            "CraftSQL: query",
+            row_count = result.len(),
+            duration_ms = query_start.elapsed().as_millis() as u64,
+            "CraftSQL: query complete",
         );
 
         Ok(result)
@@ -632,6 +664,55 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0], ColumnValue::Integer(1));
         assert_eq!(rows[1][0], ColumnValue::Integer(2));
+    }
+
+    #[tokio::test]
+    async fn concurrent_read_during_write() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(ContentAddressedStore::new(&dir.path().join("obj"), 64).unwrap());
+        let vfs = Arc::new(CidVfs::with_default_page_size(store).unwrap());
+        let kp = NodeKeypair::generate();
+        let owner = kp.node_id();
+        let db = Arc::new(
+            CraftDatabase::create(owner, vfs, &dir.path().join("sql"))
+                .await
+                .unwrap(),
+        );
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", &owner)
+            .await
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'alpha')", &owner)
+            .await
+            .unwrap();
+
+        // Launch a read and a write concurrently — both should succeed.
+        let db_r = Arc::clone(&db);
+        let db_w = Arc::clone(&db);
+        let read_handle =
+            tokio::spawn(async move { db_r.query("SELECT id, val FROM t ORDER BY id").await });
+        let write_handle = tokio::spawn(async move {
+            db_w.execute("INSERT INTO t VALUES (2, 'beta')", &owner)
+                .await
+        });
+
+        let read_result = read_handle.await.unwrap();
+        let write_result = write_handle.await.unwrap();
+
+        assert!(
+            read_result.is_ok(),
+            "read should succeed: {:?}",
+            read_result
+        );
+        assert!(
+            write_result.is_ok(),
+            "write should succeed: {:?}",
+            write_result
+        );
+
+        // Verify both rows exist.
+        let rows = db.query("SELECT id FROM t ORDER BY id").await.unwrap();
+        assert_eq!(rows.len(), 2);
     }
 
     #[tokio::test]
