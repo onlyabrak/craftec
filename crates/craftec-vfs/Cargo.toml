@@ -1,0 +1,21 @@
+[package]
+name = "craftec-vfs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+craftec-types = { workspace = true }
+craftec-crypto = { workspace = true }
+craftec-obj = { workspace = true }
+tokio = { workspace = true }
+blake3 = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+lru = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

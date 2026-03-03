@@ -1,0 +1,21 @@
+[package]
+name = "craftec-com"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+craftec-types = { workspace = true }
+craftec-crypto = { workspace = true }
+craftec-obj = { workspace = true }
+craftec-sql = { workspace = true }
+wasmtime = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+dashmap = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

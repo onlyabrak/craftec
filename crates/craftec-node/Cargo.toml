@@ -1,0 +1,29 @@
+[package]
+name = "craftec-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "craftec"
+path = "src/main.rs"
+
+[dependencies]
+craftec-types = { workspace = true }
+craftec-crypto = { workspace = true }
+craftec-obj = { workspace = true }
+craftec-rlnc = { workspace = true }
+craftec-vfs = { workspace = true }
+craftec-sql = { workspace = true }
+craftec-net = { workspace = true }
+craftec-health = { workspace = true }
+craftec-com = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

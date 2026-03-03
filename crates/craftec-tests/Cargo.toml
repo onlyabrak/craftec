@@ -1,0 +1,13 @@
+[package]
+name = "craftec-tests"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+craftec-types  = { path = "../craftec-types" }
+craftec-crypto = { path = "../craftec-crypto" }
+craftec-rlnc   = { path = "../craftec-rlnc" }
+
+[dev-dependencies]
+tokio = { workspace = true }

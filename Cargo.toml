@@ -1,0 +1,83 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/craftec-types",
+    "crates/craftec-crypto",
+    "crates/craftec-obj",
+    "crates/craftec-rlnc",
+    "crates/craftec-vfs",
+    "crates/craftec-sql",
+    "crates/craftec-net",
+    "crates/craftec-health",
+    "crates/craftec-com",
+    "crates/craftec-node",
+    "crates/craftec-tests",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Craftec Contributors"]
+repository = "https://github.com/onlyabrak/craftec"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Internal crates
+craftec-types   = { path = "crates/craftec-types" }
+craftec-crypto  = { path = "crates/craftec-crypto" }
+craftec-obj     = { path = "crates/craftec-obj" }
+craftec-rlnc    = { path = "crates/craftec-rlnc" }
+craftec-vfs     = { path = "crates/craftec-vfs" }
+craftec-sql     = { path = "crates/craftec-sql" }
+craftec-net     = { path = "crates/craftec-net" }
+craftec-health  = { path = "crates/craftec-health" }
+craftec-com     = { path = "crates/craftec-com" }
+
+# Core runtime
+tokio = { version = "1", features = ["full"] }
+
+# P2P networking — iroh 0.96 (QUIC, NAT traversal, relay)
+iroh = "0.96"
+
+# Serialization — postcard (compact binary, serde, zero-copy)
+postcard = { version = "1", features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Hashing — BLAKE3 (all CIDs, piece IDs, Merkle trees)
+blake3 = "1"
+
+# Database — libsql (SQLite-compatible)
+libsql = "0.9"
+
+# WASM runtime — wasmtime (WASI 0.2)
+wasmtime = "29"
+
+# Cryptography
+ed25519-dalek = { version = "2", features = ["serde", "rand_core"] }
+rand = "0.8"
+
+# Logging & tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Utilities
+bytes = "1"
+hex = "0.4"
+dashmap = "6"
+parking_lot = "0.12"
+lru = "0.12"
+bloomfilter = "1"
+
+# Testing
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
