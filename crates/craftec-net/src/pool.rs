@@ -15,6 +15,7 @@ use iroh::endpoint::Connection;
 use craftec_types::NodeId;
 
 /// Default idle timeout: connections unused for 5 minutes are pruned.
+#[allow(dead_code)]
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Maximum connections held in the pool before new inserts evict the oldest.
@@ -25,6 +26,7 @@ const DEFAULT_MAX_CONNECTIONS: usize = 256;
 /// A single pooled QUIC connection with bookkeeping timestamps.
 struct PooledConnection {
     connection: Connection,
+    #[allow(dead_code)]
     established_at: Instant,
     last_used: Instant,
 }
@@ -124,7 +126,10 @@ impl ConnectionPool {
         });
 
         if !evicted.is_empty() {
-            tracing::info!(pruned = evicted.len(), "ConnectionPool: idle prune complete");
+            tracing::info!(
+                pruned = evicted.len(),
+                "ConnectionPool: idle prune complete"
+            );
         }
         evicted
     }

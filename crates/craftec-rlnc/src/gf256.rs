@@ -237,10 +237,7 @@ mod tests {
         // For every non-zero element a: EXP_TABLE[LOG_TABLE[a]] == a
         for a in 1u8..=255 {
             let log_a = LOG_TABLE[a as usize] as usize;
-            assert_eq!(
-                EXP_TABLE[log_a], a,
-                "EXP/LOG mismatch for a = {a}"
-            );
+            assert_eq!(EXP_TABLE[log_a], a, "EXP/LOG mismatch for a = {a}");
         }
     }
 
@@ -256,7 +253,8 @@ mod tests {
         // EXP_TABLE[i] == EXP_TABLE[i + 255] for i in 0..255
         for i in 0..255usize {
             assert_eq!(
-                EXP_TABLE[i], EXP_TABLE[i + 255],
+                EXP_TABLE[i],
+                EXP_TABLE[i + 255],
                 "EXP_TABLE duplication failed at i = {i}"
             );
         }
@@ -360,11 +358,7 @@ mod tests {
     fn inverse_identity() {
         // a * inv(a) == 1 for all a != 0
         for a in 1u8..=255 {
-            assert_eq!(
-                gf_mul(a, gf_inv(a)),
-                1,
-                "a * inv(a) != 1 for a = {a}"
-            );
+            assert_eq!(gf_mul(a, gf_inv(a)), 1, "a * inv(a) != 1 for a = {a}");
         }
     }
 

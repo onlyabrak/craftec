@@ -76,7 +76,7 @@ pub fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     let mut current: Vec<[u8; 32]> = leaves.to_vec();
 
     while current.len() > 1 {
-        let mut next = Vec::with_capacity((current.len() + 1) / 2);
+        let mut next = Vec::with_capacity(current.len().div_ceil(2));
         let mut i = 0;
         while i < current.len() {
             let left = current[i];

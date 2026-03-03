@@ -59,17 +59,12 @@ pub struct CommitResult {
 ///
 /// # Errors
 /// Returns [`SqlError::CasConflict`] when the roots differ.
-pub fn check_cas(
-    ctx: &CommitContext,
-    current_root: Option<Cid>,
-) -> Result<()> {
+pub fn check_cas(ctx: &CommitContext, current_root: Option<Cid>) -> Result<()> {
     match (ctx.expected_root, current_root) {
-        (Some(expected), Some(current)) if expected != current => {
-            Err(SqlError::CasConflict {
-                expected: format!("{expected}"),
-                actual: format!("{current}"),
-            })
-        }
+        (Some(expected), Some(current)) if expected != current => Err(SqlError::CasConflict {
+            expected: format!("{expected}"),
+            actual: format!("{current}"),
+        }),
         _ => Ok(()),
     }
 }

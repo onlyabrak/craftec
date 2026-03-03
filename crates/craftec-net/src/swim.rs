@@ -33,19 +33,19 @@
 //! allows a node to refute suspect/dead claims by incrementing and broadcasting a
 //! higher `Alive` message.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 
 use craftec_types::{NodeId, WireMessage};
 
-/// Default time before a `Suspect` node is declared `Dead`.
-const DEFAULT_SUSPECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default time before a `Suspect` node is declared `Dead` (§13).
+const DEFAULT_SUSPECT_TIMEOUT: Duration = Duration::from_millis(1500);
 
-/// Default protocol tick period — one random peer is probed per tick.
-const DEFAULT_PROTOCOL_PERIOD: Duration = Duration::from_secs(1);
+/// Default protocol tick period — one random peer is probed per tick (§13).
+const DEFAULT_PROTOCOL_PERIOD: Duration = Duration::from_millis(500);
 
 // ── Member state ───────────────────────────────────────────────────────────
 
@@ -166,7 +166,9 @@ impl SwimMembership {
             .get(node_id)
             .map(|e| match e.value() {
                 MemberState::Alive { incarnation: inc } => incarnation > *inc,
-                MemberState::Suspect { incarnation: inc, .. } => incarnation >= *inc,
+                MemberState::Suspect {
+                    incarnation: inc, ..
+                } => incarnation >= *inc,
                 MemberState::Dead { incarnation: inc } => incarnation > *inc,
             })
             .unwrap_or(true); // Unknown node → insert
@@ -186,7 +188,10 @@ impl SwimMembership {
         if node_id == &self.local_id {
             // We are suspected — refute by incrementing our own incarnation.
             let new_inc = self.incarnation.fetch_add(1, Ordering::Relaxed) + 1;
-            tracing::info!(new_incarnation = new_inc, "SWIM: refuting suspect claim on self");
+            tracing::info!(
+                new_incarnation = new_inc,
+                "SWIM: refuting suspect claim on self"
+            );
             return;
         }
         let should_update = self
@@ -194,7 +199,9 @@ impl SwimMembership {
             .get(node_id)
             .map(|e| match e.value() {
                 MemberState::Alive { incarnation: inc } => incarnation >= *inc,
-                MemberState::Suspect { incarnation: inc, .. } => incarnation > *inc,
+                MemberState::Suspect {
+                    incarnation: inc, ..
+                } => incarnation > *inc,
                 MemberState::Dead { .. } => false, // Dead is terminal.
             })
             .unwrap_or(true);
@@ -255,7 +262,10 @@ impl SwimMembership {
         let mut responses = Vec::new();
 
         match msg {
-            WireMessage::SwimJoin { node_id, listen_port: _ } => {
+            WireMessage::SwimJoin {
+                node_id,
+                listen_port: _,
+            } => {
                 tracing::debug!(
                     from = %node_id,
                     "SWIM: processed SwimJoin"
@@ -269,7 +279,10 @@ impl SwimMembership {
                 });
             }
 
-            WireMessage::SwimAlive { node_id, incarnation } => {
+            WireMessage::SwimAlive {
+                node_id,
+                incarnation,
+            } => {
                 tracing::debug!(
                     from = %node_id,
                     incarnation,
@@ -279,7 +292,11 @@ impl SwimMembership {
                 responses.push(msg.clone());
             }
 
-            WireMessage::SwimSuspect { node_id, incarnation, .. } => {
+            WireMessage::SwimSuspect {
+                node_id,
+                incarnation,
+                ..
+            } => {
                 tracing::debug!(
                     from = %node_id,
                     incarnation,
@@ -289,7 +306,11 @@ impl SwimMembership {
                 responses.push(msg.clone());
             }
 
-            WireMessage::SwimDead { node_id, incarnation, .. } => {
+            WireMessage::SwimDead {
+                node_id,
+                incarnation,
+                ..
+            } => {
                 tracing::debug!(
                     from = %node_id,
                     incarnation,
@@ -297,6 +318,25 @@ impl SwimMembership {
                 );
                 self.mark_dead(node_id, *incarnation);
                 responses.push(msg.clone());
+            }
+
+            WireMessage::SwimPing { from, piggyback } => {
+                tracing::debug!(
+                    from = %from,
+                    piggyback_count = piggyback.len(),
+                    "SWIM: processed SwimPing"
+                );
+                // Process piggybacked membership updates.
+                for piggybacked_msg in piggyback {
+                    let sub_responses = self.handle_message(piggybacked_msg);
+                    responses.extend(sub_responses);
+                }
+                // Respond with our own Alive to confirm liveness (probe ack).
+                let own_inc = self.incarnation.load(Ordering::Relaxed);
+                responses.push(WireMessage::SwimAlive {
+                    node_id: self.local_id,
+                    incarnation: own_inc,
+                });
             }
 
             _ => {
@@ -323,10 +363,10 @@ impl SwimMembership {
         let mut newly_dead: Vec<(NodeId, u64)> = Vec::new();
 
         for entry in self.members.iter() {
-            if let MemberState::Suspect { incarnation, since } = entry.value() {
-                if now.duration_since(*since) >= self.suspect_timeout {
-                    newly_dead.push((*entry.key(), *incarnation));
-                }
+            if let MemberState::Suspect { incarnation, since } = entry.value()
+                && now.duration_since(*since) >= self.suspect_timeout
+            {
+                newly_dead.push((*entry.key(), *incarnation));
             }
         }
         for (node_id, incarnation) in &newly_dead {
@@ -392,15 +432,20 @@ impl SwimMembership {
             .into_iter()
             .take(limit)
             .map(|(node_id, state)| match state {
-                MemberState::Alive { incarnation } => {
-                    WireMessage::SwimAlive { node_id, incarnation }
-                }
-                MemberState::Suspect { incarnation, .. } => {
-                    WireMessage::SwimSuspect { node_id, incarnation, from: self.local_id }
-                }
-                MemberState::Dead { incarnation } => {
-                    WireMessage::SwimDead { node_id, incarnation, from: self.local_id }
-                }
+                MemberState::Alive { incarnation } => WireMessage::SwimAlive {
+                    node_id,
+                    incarnation,
+                },
+                MemberState::Suspect { incarnation, .. } => WireMessage::SwimSuspect {
+                    node_id,
+                    incarnation,
+                    from: self.local_id,
+                },
+                MemberState::Dead { incarnation } => WireMessage::SwimDead {
+                    node_id,
+                    incarnation,
+                    from: self.local_id,
+                },
             })
             .collect()
     }
@@ -413,11 +458,10 @@ impl SwimMembership {
 /// Runs one [`SwimMembership::protocol_tick`] per `swim.protocol_period` until a
 /// signal is received on `shutdown`.
 ///
-/// Returns the list of `(NodeId, WireMessage)` probe pairs from the last tick for
-/// the caller to dispatch over the network.  In production, the caller sends these
-/// via [`CraftecEndpoint::send_message`].
+/// Probes are dispatched to peers via `endpoint.send_message()`.
 pub async fn run_swim_loop(
     swim: Arc<SwimMembership>,
+    endpoint: Arc<crate::endpoint::CraftecEndpoint>,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) {
     let period = swim.protocol_period;
@@ -426,9 +470,19 @@ pub async fn run_swim_loop(
     loop {
         tokio::select! {
             _ = tokio::time::sleep(period) => {
-                let _probes = swim.protocol_tick().await;
-                // Callers that need to actually dispatch probes should use
-                // SwimMembership directly and wire into CraftecEndpoint.
+                let probes = swim.protocol_tick().await;
+                for (target, msg) in probes {
+                    let ep = endpoint.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = ep.send_message(&target, &msg).await {
+                            tracing::debug!(
+                                peer = %target,
+                                error = %e,
+                                "SWIM: failed to send probe"
+                            );
+                        }
+                    });
+                }
             }
             _ = shutdown.recv() => {
                 tracing::info!("SWIM: shutdown signal received — stopping loop");
@@ -546,5 +600,37 @@ mod tests {
         assert_eq!(probes.len(), 1);
         assert_eq!(probes[0].0, peer);
         assert!(matches!(probes[0].1, WireMessage::SwimPing { .. }));
+    }
+
+    #[test]
+    fn handle_swim_ping_responds_with_alive() {
+        let local = NodeId::generate();
+        let swim = SwimMembership::new(local);
+        let peer = NodeId::generate();
+
+        let piggyback_node = NodeId::generate();
+        let msg = WireMessage::SwimPing {
+            from: peer,
+            piggyback: vec![WireMessage::SwimAlive {
+                node_id: piggyback_node,
+                incarnation: 1,
+            }],
+        };
+
+        let responses = swim.handle_message(&msg);
+        // Should contain at least our own SwimAlive ack.
+        assert!(responses.iter().any(|r| matches!(
+            r,
+            WireMessage::SwimAlive { node_id, .. } if *node_id == local
+        )));
+        // Piggybacked node should be marked alive.
+        assert!(swim.is_alive(&piggyback_node));
+    }
+
+    #[test]
+    fn swim_parameters_match_spec() {
+        let swim = make_swim();
+        assert_eq!(swim.protocol_period, Duration::from_millis(500));
+        assert_eq!(swim.suspect_timeout, Duration::from_millis(1500));
     }
 }

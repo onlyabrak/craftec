@@ -30,7 +30,9 @@ use anyhow::Result;
 use tracing_subscriber::{EnvFilter, fmt};
 
 mod event_bus;
+mod handler;
 mod node;
+mod pending;
 mod shutdown;
 
 #[tokio::main]
@@ -62,8 +64,7 @@ async fn main() -> Result<()> {
 /// Falls back to `"info"` if `RUST_LOG` is unset or unparseable.
 /// Output format: human-readable with targets, thread IDs, file, and line number.
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     fmt()
         .with_env_filter(filter)

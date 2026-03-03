@@ -119,9 +119,9 @@ impl PageIndex {
         for i in 0..count {
             let offset = 4 + i * 36;
             let page_num = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-            let cid_bytes: [u8; 32] = data[offset + 4..offset + 36].try_into().map_err(|_| {
-                VfsError::SerializationError("CID slice has wrong length".into())
-            })?;
+            let cid_bytes: [u8; 32] = data[offset + 4..offset + 36]
+                .try_into()
+                .map_err(|_| VfsError::SerializationError("CID slice has wrong length".into()))?;
             let cid = Cid::from_bytes(cid_bytes);
             entries.insert(page_num, cid);
         }

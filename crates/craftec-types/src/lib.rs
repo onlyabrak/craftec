@@ -15,10 +15,10 @@ pub mod piece;
 pub mod wire;
 
 // Convenience re-exports of the most commonly used types.
-pub use cid::{Cid, CID_SIZE};
+pub use cid::{CID_SIZE, Cid};
 pub use config::NodeConfig;
 pub use error::{CraftecError, Result};
 pub use event::Event;
 pub use identity::{NodeId, NodeKeypair, Signature};
-pub use piece::{CodedPiece, HomMAC, PieceId, PieceIndex, GF_ORDER, K_DEFAULT, PAGE_SIZE};
-pub use wire::{decode, encode, WireMessage};
+pub use piece::{CodedPiece, GF_ORDER, HomMAC, K_DEFAULT, PAGE_SIZE, PieceId, PieceIndex};
+pub use wire::{WireMessage, decode, encode};

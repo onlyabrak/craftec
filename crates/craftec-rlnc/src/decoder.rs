@@ -159,7 +159,7 @@ impl RlncDecoder {
                     k = self.k,
                     "RLNC: discarded linearly dependent piece"
                 );
-                return Ok(false);
+                Ok(false)
             }
             Some(col) => {
                 // Normalise so that the pivot coefficient is 1.
@@ -326,7 +326,10 @@ mod tests {
         let enc = RlncEncoder::new(&vec![0u8; 256], 8).unwrap(); // k=8, not 4
         let piece = enc.encode_piece();
         let result = dec.add_piece(&piece);
-        assert!(matches!(result, Err(RlncError::CodingVectorLengthMismatch { .. })));
+        assert!(matches!(
+            result,
+            Err(RlncError::CodingVectorLengthMismatch { .. })
+        ));
     }
 
     #[test]
@@ -336,7 +339,7 @@ mod tests {
         let cid = Cid::from_data(b"test");
         let cv = vec![1u8; 4]; // k=4
         let data = vec![0u8; 32]; // wrong size (expect 64)
-        let tag = [0u8; 32]; // placeholder tag
+        let tag = [0u8; 32]; // tag irrelevant — piece rejected by size check
         let piece = CodedPiece::new(cid, cv, data, tag);
 
         let mut dec = RlncDecoder::new(4, 64);

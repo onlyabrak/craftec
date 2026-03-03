@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use craftec_types::{Cid, NodeId};
 
-use crate::commit::{check_cas, check_ownership, CommitContext};
+use crate::commit::{CommitContext, check_cas, check_ownership};
 use crate::database::{CraftDatabase, SignedWrite};
 use crate::error::{Result, SqlError};
 
@@ -175,7 +175,11 @@ mod tests {
     async fn owner_write_succeeds() {
         let (handler, keypair, _dir) = make_handler().await;
         let current_root = handler.database().root_cid();
-        let msg = sign_write(&keypair, "INSERT INTO t VALUES (1)", Some(current_root));
+        let msg = sign_write(
+            &keypair,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY)",
+            Some(current_root),
+        );
         let new_root = handler.handle_signed_write(&msg).await.unwrap();
         assert_ne!(new_root, current_root);
     }
@@ -206,7 +210,11 @@ mod tests {
         let (handler, _owner_kp, _dir) = make_handler().await;
         let non_owner_kp = NodeKeypair::generate();
         let current_root = handler.database().root_cid();
-        let msg = sign_write(&non_owner_kp, "INSERT INTO t VALUES (2)", Some(current_root));
+        let msg = sign_write(
+            &non_owner_kp,
+            "INSERT INTO t VALUES (2)",
+            Some(current_root),
+        );
         assert!(matches!(
             handler.handle_signed_write(&msg).await,
             Err(SqlError::UnauthorizedWriter { .. })

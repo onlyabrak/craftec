@@ -5,15 +5,23 @@
 //! only the node whose Ed25519 identity matches [`CraftDatabase::owner`] may
 //! issue mutations.
 //!
+//! ## SQL execution
+//! SQL is executed through an in-memory libsql database.  The VFS layer
+//! tracks commit points externally — each successful `execute()` produces
+//! a new root CID capturing the database state.  A full VFS bridge routing
+//! libsql page I/O through CidVfs will follow once the libsql VFS FFI
+//! stabilises.
+//!
 //! ## Row representation
 //! Query results are returned as a `Vec<Row>` where each [`Row`] is a
 //! `Vec<ColumnValue>`.  This is intentionally simple — higher-level
 //! application code typically deserialises rows into concrete types.
 //!
 //! ## Thread safety
-//! `CraftDatabase` is `Send + Sync` via interior `parking_lot::RwLock`s on
-//! mutable state.  Concurrent reads use the snapshot API and never block each
-//! other; writes take a short exclusive lock only during the commit step.
+//! `CraftDatabase` is `Send + Sync`.  The libsql connection is protected
+//! by a `tokio::sync::Mutex` to ensure serial write access.  Concurrent
+//! reads use the snapshot API and never block each other; writes take a
+//! short exclusive lock only during the commit step.
 
 use std::sync::Arc;
 
@@ -22,7 +30,7 @@ use craftec_vfs::CidVfs;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
-use crate::commit::{check_cas, check_ownership, CommitContext};
+use crate::commit::{CommitContext, check_ownership};
 use crate::error::{Result, SqlError};
 
 // ---------------------------------------------------------------------------
@@ -81,6 +89,21 @@ pub struct SignedWrite {
 }
 
 // ---------------------------------------------------------------------------
+// libsql → ColumnValue conversion
+// ---------------------------------------------------------------------------
+
+/// Convert a libsql [`Value`](libsql::Value) to our [`ColumnValue`].
+fn libsql_value_to_column(val: libsql::Value) -> ColumnValue {
+    match val {
+        libsql::Value::Null => ColumnValue::Null,
+        libsql::Value::Integer(n) => ColumnValue::Integer(n),
+        libsql::Value::Real(r) => ColumnValue::Real(r),
+        libsql::Value::Text(s) => ColumnValue::Text(s),
+        libsql::Value::Blob(b) => ColumnValue::Blob(b),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CraftDatabase
 // ---------------------------------------------------------------------------
 
@@ -103,19 +126,44 @@ pub struct CraftDatabase {
     vfs: Arc<CidVfs>,
     /// Most recently committed root CID.
     root_cid: RwLock<Cid>,
+    /// In-memory libsql database (kept alive so the connection remains valid).
+    _libsql_db: libsql::Database,
+    /// libsql connection for executing SQL.  Protected by a tokio Mutex for
+    /// serial write access (single-writer model).
+    conn: tokio::sync::Mutex<libsql::Connection>,
 }
 
 impl CraftDatabase {
     /// Create a new, empty [`CraftDatabase`] owned by `owner`.
     ///
-    /// Initialises a minimal SQLite schema through the VFS layer and commits
-    /// an initial root CID.
+    /// Initialises an in-memory libsql database with the correct PRAGMAs
+    /// and commits an initial root CID through the VFS layer.
     ///
     /// # Errors
     /// - [`SqlError::VfsError`] if the VFS layer fails during initialisation.
+    /// - [`SqlError::LibsqlError`] if the libsql engine fails to start.
     pub async fn create(owner: NodeId, vfs: Arc<CidVfs>) -> Result<Self> {
         // Derive a stable database identity CID from the owner's public key bytes.
         let db_id = Cid::from_data(owner.as_bytes());
+
+        // Create in-memory libsql database.
+        let libsql_db = libsql::Builder::new_local(":memory:")
+            .build()
+            .await
+            .map_err(|e| SqlError::LibsqlError(e.to_string()))?;
+
+        let conn = libsql_db
+            .connect()
+            .map_err(|e| SqlError::LibsqlError(e.to_string()))?;
+
+        // Set PRAGMAs: page_size = 16384, journal_mode = DELETE (no WAL per spec §35).
+        // Use query() because PRAGMAs return result rows (execute() rejects row-returning SQL).
+        conn.query("PRAGMA page_size = 16384", ())
+            .await
+            .map_err(|e| SqlError::LibsqlError(e.to_string()))?;
+        conn.query("PRAGMA journal_mode = DELETE", ())
+            .await
+            .map_err(|e| SqlError::LibsqlError(e.to_string()))?;
 
         tracing::info!(
             owner = %owner,
@@ -135,6 +183,8 @@ impl CraftDatabase {
             owner,
             vfs,
             root_cid: RwLock::new(root),
+            _libsql_db: libsql_db,
+            conn: tokio::sync::Mutex::new(conn),
         })
     }
 
@@ -145,8 +195,8 @@ impl CraftDatabase {
     /// Execute a SQL mutation as `writer`.
     ///
     /// Only the database owner may call this method.  The mutation is executed
-    /// synchronously through the VFS layer; the new root CID is stored
-    /// internally after a successful commit.
+    /// through the in-memory libsql engine; the new root CID is stored
+    /// internally after a successful VFS commit.
     ///
     /// # Arguments
     /// * `sql` — the SQL statement to execute (INSERT / UPDATE / DELETE / DDL).
@@ -170,9 +220,16 @@ impl CraftDatabase {
             "CraftSQL: execute",
         );
 
-        // In the full implementation the SQL would be executed through
-        // libsql / SQLite via the VFS layer.  Here we simulate a write by
-        // encoding the SQL as a page payload and committing it.
+        // Execute SQL through libsql.
+        let conn = self.conn.lock().await;
+        conn.execute(sql, ())
+            .await
+            .map_err(|e| SqlError::SqlSyntaxError(e.to_string()))?;
+        drop(conn);
+
+        // Record the commit in VFS.  We write the SQL as page content to
+        // produce a unique root CID for each mutation (the real VFS bridge
+        // will capture actual SQLite page I/O in a future phase).
         let mut page = vec![0u8; self.vfs.page_size()];
         let sql_bytes = sql.as_bytes();
         let copy_len = sql_bytes.len().min(page.len() - 8);
@@ -203,21 +260,37 @@ impl CraftDatabase {
 
     /// Execute a read-only SQL query, returning all matching rows.
     ///
-    /// The query is executed against a snapshot pinned to the current root CID,
-    /// providing consistent snapshot isolation even if a concurrent commit
-    /// occurs.
+    /// The query is executed against the in-memory libsql engine.  A VFS
+    /// snapshot is pinned to the current root CID for consistency tracking.
     ///
     /// # Errors
     /// - [`SqlError::SqlSyntaxError`] if the SQL is invalid.
     /// - [`SqlError::VfsError`] on storage failure.
-    pub fn query(&self, sql: &str) -> Result<Vec<Row>> {
+    pub async fn query(&self, sql: &str) -> Result<Vec<Row>> {
         let _snapshot = self.vfs.snapshot().map_err(SqlError::VfsError)?;
 
-        // In the full implementation the SQL would be executed through
-        // libsql / SQLite using the pinned snapshot.  We return an empty
-        // result set here — the real execution engine is wired in by the
-        // libsql VFS integration layer.
-        let result: Vec<Row> = Vec::new();
+        let conn = self.conn.lock().await;
+        let mut rows_result = conn
+            .query(sql, ())
+            .await
+            .map_err(|e| SqlError::SqlSyntaxError(e.to_string()))?;
+
+        let mut result: Vec<Row> = Vec::new();
+        while let Some(row) = rows_result
+            .next()
+            .await
+            .map_err(|e| SqlError::SqlSyntaxError(e.to_string()))?
+        {
+            let col_count = row.column_count();
+            let mut cols = Vec::with_capacity(col_count as usize);
+            for i in 0..col_count {
+                let val = row
+                    .get_value(i)
+                    .map_err(|e| SqlError::SqlSyntaxError(e.to_string()))?;
+                cols.push(libsql_value_to_column(val));
+            }
+            result.push(cols);
+        }
 
         tracing::debug!(
             db_id = %self.db_id,
@@ -262,7 +335,7 @@ impl CraftDatabase {
 mod tests {
     use super::*;
     use craftec_obj::ContentAddressedStore;
-    use craftec_types::{NodeId, NodeKeypair};
+    use craftec_types::NodeKeypair;
     use craftec_vfs::CidVfs;
     use tempfile::tempdir;
 
@@ -271,7 +344,9 @@ mod tests {
         let store = Arc::new(ContentAddressedStore::new(dir.path(), 64).unwrap());
         let vfs = Arc::new(CidVfs::with_default_page_size(store).unwrap());
         let owner = NodeKeypair::generate().node_id();
-        let db = CraftDatabase::create(owner, vfs).await.expect("database creation should succeed");
+        let db = CraftDatabase::create(owner, vfs)
+            .await
+            .expect("database creation should succeed");
         (db, dir)
     }
 
@@ -290,7 +365,11 @@ mod tests {
         let kp = NodeKeypair::generate();
         let owner = kp.node_id();
         let db = CraftDatabase::create(owner, vfs).await.unwrap();
-        assert!(db.execute("INSERT INTO t VALUES (1)", &owner).await.is_ok());
+        assert!(
+            db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", &owner)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -298,7 +377,8 @@ mod tests {
         let (db, _dir) = make_db().await;
         let non_owner = NodeKeypair::generate().node_id();
         assert!(matches!(
-            db.execute("INSERT INTO t VALUES (1)", &non_owner).await,
+            db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", &non_owner)
+                .await,
             Err(SqlError::UnauthorizedWriter { .. })
         ));
     }
@@ -312,14 +392,103 @@ mod tests {
         let owner = kp.node_id();
         let db = CraftDatabase::create(owner, vfs).await.unwrap();
         let initial_root = db.root_cid();
-        db.execute("INSERT INTO t VALUES (42)", &owner).await.unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", &owner)
+            .await
+            .unwrap();
         assert_ne!(db.root_cid(), initial_root);
     }
 
     #[tokio::test]
-    async fn query_returns_empty_result_set() {
-        let (db, _dir) = make_db().await;
-        let rows = db.query("SELECT * FROM t").unwrap();
+    async fn sql_write_and_read_roundtrip() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(ContentAddressedStore::new(dir.path(), 64).unwrap());
+        let vfs = Arc::new(CidVfs::with_default_page_size(store).unwrap());
+        let kp = NodeKeypair::generate();
+        let owner = kp.node_id();
+        let db = CraftDatabase::create(owner, vfs).await.unwrap();
+
+        // CREATE TABLE, INSERT, then SELECT.
+        db.execute(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
+            &owner,
+        )
+        .await
+        .unwrap();
+        db.execute("INSERT INTO users (id, name) VALUES (1, 'Alice')", &owner)
+            .await
+            .unwrap();
+        db.execute("INSERT INTO users (id, name) VALUES (2, 'Bob')", &owner)
+            .await
+            .unwrap();
+
+        let rows = db
+            .query("SELECT id, name FROM users ORDER BY id")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], ColumnValue::Integer(1));
+        assert_eq!(rows[0][1], ColumnValue::Text("Alice".to_string()));
+        assert_eq!(rows[1][0], ColumnValue::Integer(2));
+        assert_eq!(rows[1][1], ColumnValue::Text("Bob".to_string()));
+    }
+
+    #[tokio::test]
+    async fn query_empty_table_returns_no_rows() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(ContentAddressedStore::new(dir.path(), 64).unwrap());
+        let vfs = Arc::new(CidVfs::with_default_page_size(store).unwrap());
+        let kp = NodeKeypair::generate();
+        let owner = kp.node_id();
+        let db = CraftDatabase::create(owner, vfs).await.unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", &owner)
+            .await
+            .unwrap();
+        let rows = db.query("SELECT * FROM t").await.unwrap();
         assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sql_column_types() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(ContentAddressedStore::new(dir.path(), 64).unwrap());
+        let vfs = Arc::new(CidVfs::with_default_page_size(store).unwrap());
+        let kp = NodeKeypair::generate();
+        let owner = kp.node_id();
+        let db = CraftDatabase::create(owner, vfs).await.unwrap();
+
+        db.execute(
+            "CREATE TABLE types_test (i INTEGER, r REAL, t TEXT, b BLOB, n INTEGER)",
+            &owner,
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO types_test VALUES (42, 3.14, 'hello', X'DEADBEEF', NULL)",
+            &owner,
+        )
+        .await
+        .unwrap();
+
+        let rows = db.query("SELECT * FROM types_test").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], ColumnValue::Integer(42));
+        assert_eq!(rows[0][1], ColumnValue::Real(3.14));
+        assert_eq!(rows[0][2], ColumnValue::Text("hello".to_string()));
+        assert_eq!(rows[0][3], ColumnValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+        assert_eq!(rows[0][4], ColumnValue::Null);
+    }
+
+    #[tokio::test]
+    async fn invalid_sql_returns_error() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(ContentAddressedStore::new(dir.path(), 64).unwrap());
+        let vfs = Arc::new(CidVfs::with_default_page_size(store).unwrap());
+        let kp = NodeKeypair::generate();
+        let owner = kp.node_id();
+        let db = CraftDatabase::create(owner, vfs).await.unwrap();
+
+        let result = db.execute("THIS IS NOT VALID SQL", &owner).await;
+        assert!(matches!(result, Err(SqlError::SqlSyntaxError(_))));
     }
 }

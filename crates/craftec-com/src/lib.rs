@@ -53,6 +53,6 @@ pub mod scheduler;
 // Convenience re-exports.
 pub use agent::{Agent, AgentKind};
 pub use error::{ComError, Result};
-pub use host::HostFunctions;
+pub use host::{HostFunctions, HostState};
 pub use runtime::{ComRuntime, DEFAULT_FUEL_LIMIT};
 pub use scheduler::{ProgramScheduler, ProgramState};

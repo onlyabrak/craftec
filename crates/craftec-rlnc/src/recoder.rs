@@ -111,11 +111,8 @@ impl RlncRecoder {
         // Recompute PieceId from new coded data.
         let _piece_id = PieceId::from_data(&new_data);
 
-        // Combine HomMAC tags homomorphically.
-        // For a proper HomMAC scheme the combination would be:
-        //   tag' = Σⱼ scalars[j] * tags[j]  (GF(2⁸) scalar × tag)
-        // The current HomMAC::combine uses XOR which corresponds to
-        // GF(2)-linear combination — consistent with the scalar-1 case.
+        // Combine HomMAC tags homomorphically:
+        //   tag' = Σⱼ scalars[j] * tags[j]  (GF(2⁸) linear combination)
         let tags: Vec<HomMAC> = pieces.iter().map(|p| p.hommac_tag).collect();
         let scalars_for_combine: Vec<u8> = scalars.clone();
         let hom_mac: HomMAC = hommac_combine(
@@ -138,8 +135,8 @@ impl RlncRecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encoder::RlncEncoder;
     use crate::decoder::RlncDecoder;
+    use crate::encoder::RlncEncoder;
 
     fn make_pieces(data: &[u8], k: u32, count: usize) -> Vec<CodedPiece> {
         let encoder = RlncEncoder::new(data, k).expect("encoder");
@@ -150,13 +147,19 @@ mod tests {
     fn recode_requires_two_pieces() {
         let pieces = make_pieces(&[1u8; 256], 4, 1);
         let result = RlncRecoder::recode(&pieces);
-        assert!(matches!(result, Err(RlncError::InsufficientRecodeInputs { got: 1 })));
+        assert!(matches!(
+            result,
+            Err(RlncError::InsufficientRecodeInputs { got: 1 })
+        ));
     }
 
     #[test]
     fn recode_rejects_empty() {
         let result = RlncRecoder::recode(&[]);
-        assert!(matches!(result, Err(RlncError::InsufficientRecodeInputs { got: 0 })));
+        assert!(matches!(
+            result,
+            Err(RlncError::InsufficientRecodeInputs { got: 0 })
+        ));
     }
 
     #[test]
@@ -186,7 +189,10 @@ mod tests {
         let pieces = make_pieces(&data, 4, 3);
         let recoded = RlncRecoder::recode(&pieces).unwrap();
         // PieceId should equal BLAKE3(recoded.data).
-        assert!(recoded.verify_piece_id(), "PieceId of recoded piece is wrong");
+        assert!(
+            recoded.verify_piece_id(),
+            "PieceId of recoded piece is wrong"
+        );
     }
 
     #[test]
@@ -236,8 +242,11 @@ mod tests {
 
         if decoder.is_decodable() {
             let recovered = decoder.decode().expect("decode failed");
-            assert_eq!(&recovered[..data.len()], data.as_slice(),
-                "data mismatch after recode-in-loop decode");
+            assert_eq!(
+                &recovered[..data.len()],
+                data.as_slice(),
+                "data mismatch after recode-in-loop decode"
+            );
         }
         // If not decodable (very unlikely), we still pass; the main
         // correctness check is that no errors were thrown.

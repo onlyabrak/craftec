@@ -202,7 +202,10 @@ mod tests {
 
         assert_eq!(cache.len(), 3);
         // c0 was accessed, c2 and c3 were inserted — c1 is LRU.
-        assert!(cache.get(&c1).is_none(), "LRU entry should have been evicted");
+        assert!(
+            cache.get(&c1).is_none(),
+            "LRU entry should have been evicted"
+        );
         assert!(cache.get(&c0).is_some());
         assert!(cache.get(&c2).is_some());
         assert!(cache.get(&c3).is_some());

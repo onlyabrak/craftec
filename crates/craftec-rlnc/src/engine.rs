@@ -107,7 +107,10 @@ impl RlncEngine {
 
     /// Create a new [`RlncEngine`] with a concurrency limit of 8.
     pub fn new() -> Self {
-        info!("RLNC engine initialized with concurrency limit {}", Self::MAX_CONCURRENCY);
+        info!(
+            "RLNC engine initialized with concurrency limit {}",
+            Self::MAX_CONCURRENCY
+        );
         Self {
             semaphore: Arc::new(Semaphore::new(Self::MAX_CONCURRENCY)),
             metrics: Arc::new(RlncMetrics::default()),
@@ -147,7 +150,9 @@ impl RlncEngine {
         let result = encoder.encode_n(n);
 
         self.metrics.encodes.fetch_add(1, Ordering::Relaxed);
-        self.metrics.encode_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+        self.metrics
+            .encode_bytes
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
 
         info!(
             size = data.len(),
@@ -186,8 +191,10 @@ impl RlncEngine {
         for piece in pieces {
             match decoder.add_piece(piece) {
                 Ok(_) => {}
-                Err(RlncError::CodingVectorLengthMismatch { .. } |
-                    RlncError::InvalidPieceSize { .. }) => {
+                Err(
+                    RlncError::CodingVectorLengthMismatch { .. }
+                    | RlncError::InvalidPieceSize { .. },
+                ) => {
                     // Skip malformed pieces rather than aborting.
                     tracing::warn!("skipping malformed piece during decode");
                 }
@@ -305,9 +312,7 @@ mod tests {
             .map(|_| {
                 let engine = Arc::clone(&engine);
                 let data = Arc::clone(&data);
-                tokio::spawn(async move {
-                    engine.encode(&data, 8).await
-                })
+                tokio::spawn(async move { engine.encode(&data, 8).await })
             })
             .collect();
 
@@ -317,7 +322,11 @@ mod tests {
         }
 
         let snap = engine.metrics().snapshot();
-        assert_eq!(snap.encodes, 16, "expected 16 encodes, got {}", snap.encodes);
+        assert_eq!(
+            snap.encodes, 16,
+            "expected 16 encodes, got {}",
+            snap.encodes
+        );
     }
 
     #[tokio::test]

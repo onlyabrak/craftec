@@ -33,8 +33,8 @@
 //! partial write.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use craftec_types::Cid;
@@ -196,10 +196,7 @@ impl ContentAddressedStore {
     /// - [`ObjError::IoError`] on other I/O failures.
     pub async fn put(&self, data: &[u8]) -> Result<Cid> {
         let cid = Cid::from_data(data);
-        self.inner
-            .metrics
-            .puts
-            .fetch_add(1, Ordering::Relaxed);
+        self.inner.metrics.puts.fetch_add(1, Ordering::Relaxed);
 
         debug!(
             cid = %cid,
@@ -236,9 +233,7 @@ impl ContentAddressedStore {
 
         // Update in-memory state.
         self.inner.bloom.write().insert(&cid);
-        self.inner
-            .cache
-            .put(cid, Bytes::copy_from_slice(data));
+        self.inner.cache.put(cid, Bytes::copy_from_slice(data));
 
         trace!(cid = %cid, size = data.len(), "CraftOBJ: put object — write complete");
         Ok(cid)
@@ -268,10 +263,7 @@ impl ContentAddressedStore {
     /// - `Ok(None)` — object is not present in this store.
     /// - `Err(ObjError::IntegrityViolation)` — object found but corrupted.
     pub async fn get(&self, cid: &Cid) -> Result<Option<Bytes>> {
-        self.inner
-            .metrics
-            .gets
-            .fetch_add(1, Ordering::Relaxed);
+        self.inner.metrics.gets.fetch_add(1, Ordering::Relaxed);
 
         // Layer 1: LRU cache.
         if let Some(bytes) = self.inner.cache.get(cid) {
@@ -325,10 +317,7 @@ impl ContentAddressedStore {
             );
             return Err(ObjError::IntegrityViolation {
                 cid: cid.to_string(),
-                msg: format!(
-                    "stored bytes hash to {} but CID is {}",
-                    actual_cid, cid
-                ),
+                msg: format!("stored bytes hash to {} but CID is {}", actual_cid, cid),
             });
         }
 
@@ -407,10 +396,10 @@ impl ContentAddressedStore {
         let cids = tokio::task::spawn_blocking(move || shard::walk_shards(&base_dir))
             .await
             .map_err(|e| {
-                ObjError::IoError(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("spawn_blocking panicked: {}", e),
-                ))
+                ObjError::IoError(std::io::Error::other(format!(
+                    "spawn_blocking panicked: {}",
+                    e
+                )))
             })??;
 
         debug!(count = cids.len(), "CraftOBJ: listed all CIDs");
@@ -465,11 +454,7 @@ impl ContentAddressedStore {
             }
             for entry in std::fs::read_dir(&shard_dir).map_err(ObjError::IoError)? {
                 let entry = entry.map_err(ObjError::IoError)?;
-                if entry
-                    .metadata()
-                    .map(|m| m.is_file())
-                    .unwrap_or(false)
-                {
+                if entry.metadata().map(|m| m.is_file()).unwrap_or(false) {
                     count += 1;
                 }
             }
@@ -525,7 +510,11 @@ mod tests {
         let (store, _dir) = make_store().await;
         let data = b"hello craftec world";
         let cid = store.put(data).await.unwrap();
-        let retrieved = store.get(&cid).await.unwrap().expect("object must be found");
+        let retrieved = store
+            .get(&cid)
+            .await
+            .unwrap()
+            .expect("object must be found");
         assert_eq!(retrieved.as_ref(), data);
     }
 
@@ -639,7 +628,10 @@ mod tests {
         // disk should still serve them correctly.
         for cid in &cids {
             let result = store.get(cid).await.unwrap();
-            assert!(result.is_some(), "evicted objects must still be readable from disk");
+            assert!(
+                result.is_some(),
+                "evicted objects must still be readable from disk"
+            );
         }
     }
 

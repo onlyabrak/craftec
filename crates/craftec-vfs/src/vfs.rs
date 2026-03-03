@@ -10,10 +10,10 @@
 //!    requests a sync.
 //! 3. On [`commit`](CidVfs::commit):
 //!    a. Each dirty page is stored in CraftOBJ via `store.put(page_bytes)`.
-//!       CraftOBJ computes `CID = blake3(page_bytes)` internally.
+//!    CraftOBJ computes `CID = blake3(page_bytes)` internally.
 //!    b. The page index is updated: `page_num → CID`.
 //!    c. The full page index is serialised; its bytes are put into CraftOBJ
-//!       to produce the new root CID.
+//!    to produce the new root CID.
 //!    d. `dirty_pages` is cleared.
 //!
 //! ## Read path
@@ -34,8 +34,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use craftec_types::Cid;
 use craftec_obj::ContentAddressedStore;
+use craftec_types::Cid;
 use parking_lot::{Mutex, RwLock};
 
 use crate::error::{Result, VfsError};
@@ -84,7 +84,7 @@ impl CidVfs {
     /// Returns [`VfsError::InvalidPageSize`] if `page_size` is not a
     /// power of two or is outside the range 512 – 65536.
     pub fn new(store: Arc<ContentAddressedStore>, page_size: usize) -> Result<Self> {
-        if page_size < 512 || page_size > 65536 || !page_size.is_power_of_two() {
+        if !(512..=65536).contains(&page_size) || !page_size.is_power_of_two() {
             return Err(VfsError::InvalidPageSize(page_size));
         }
         tracing::info!(page_size = page_size, "CID-VFS: initialized");
@@ -348,7 +348,10 @@ mod tests {
         let (vfs, _dir) = make_vfs();
         vfs.write_page(0, &page(0x01)).unwrap();
         vfs.commit().await.unwrap();
-        assert!(matches!(vfs.read_page(99).await, Err(VfsError::PageNotFound(99))));
+        assert!(matches!(
+            vfs.read_page(99).await,
+            Err(VfsError::PageNotFound(99))
+        ));
     }
 
     #[tokio::test]
@@ -367,7 +370,10 @@ mod tests {
 
         let root1 = vfs1.commit().await.unwrap();
         let root2 = vfs2.commit().await.unwrap();
-        assert_eq!(root1, root2, "identical content must produce identical root CID");
+        assert_eq!(
+            root1, root2,
+            "identical content must produce identical root CID"
+        );
     }
 
     #[tokio::test]

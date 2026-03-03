@@ -9,6 +9,7 @@ craftec-types = { workspace = true }
 craftec-crypto = { workspace = true }
 craftec-obj = { workspace = true }
 craftec-vfs = { workspace = true }
+libsql = { workspace = true }
 tokio = { workspace = true }
 blake3 = { workspace = true }
 tracing = { workspace = true }

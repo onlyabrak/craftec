@@ -74,9 +74,7 @@ impl NaturalSelectionCoordinator {
                         .unwrap_or(std::cmp::Ordering::Equal)
                 }) // higher reputation first
                 .then_with(|| {
-                    a.node_id
-                        .as_bytes()
-                        .cmp(b.node_id.as_bytes()) // lower NodeId first (tiebreaker)
+                    a.node_id.as_bytes().cmp(b.node_id.as_bytes()) // lower NodeId first (tiebreaker)
                 })
         })?;
 
@@ -161,8 +159,7 @@ mod tests {
         let same_uptime = 500;
         let low_rep = ranking(same_uptime, 0.4);
         let high_rep = ranking(same_uptime, 0.9);
-        let winner =
-            NaturalSelectionCoordinator::select_coordinator(&[low_rep, high_rep.clone()]);
+        let winner = NaturalSelectionCoordinator::select_coordinator(&[low_rep, high_rep.clone()]);
         assert_eq!(winner, Some(high_rep.node_id));
     }
 
@@ -187,7 +184,7 @@ mod tests {
     fn rank_providers_order() {
         let r1 = ranking(9999, 0.9); // best
         let r2 = ranking(5000, 0.8); // second
-        let r3 = ranking(100, 0.1);  // worst
+        let r3 = ranking(100, 0.1); // worst
         let ranked =
             NaturalSelectionCoordinator::rank_providers(&[r3.clone(), r1.clone(), r2.clone()]);
         assert_eq!(ranked[0], r1.node_id);

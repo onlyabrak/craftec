@@ -26,12 +26,14 @@ pub mod connection;
 pub mod dht;
 pub mod endpoint;
 pub mod error;
+pub mod pending;
 pub mod pool;
 pub mod swim;
 
 pub use connection::ConnectionHandler;
-pub use dht::DhtProviders;
-pub use endpoint::{CraftecEndpoint, ALPN_CRAFTEC, ALPN_SWIM};
+pub use dht::{DhtProviders, announce_cid_to_peers};
+pub use endpoint::{ALPN_CRAFTEC, ALPN_SWIM, CraftecEndpoint};
 pub use error::NetError;
+pub use pending::PendingFetches;
 pub use pool::ConnectionPool;
 pub use swim::SwimMembership;

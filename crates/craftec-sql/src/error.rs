@@ -46,6 +46,10 @@ pub enum SqlError {
     #[error("serialization error: {0}")]
     SerializationError(String),
 
+    /// libsql database engine error.
+    #[error("libsql error: {0}")]
+    LibsqlError(String),
+
     /// Generic I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

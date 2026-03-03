@@ -21,7 +21,6 @@ use crate::piece::CodedPiece;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WireMessage {
     // ── Liveness ──────────────────────────────────────────────────────
-
     /// Echo request.
     Ping {
         /// Arbitrary caller-chosen nonce echoed back in the `Pong`.
@@ -35,7 +34,6 @@ pub enum WireMessage {
     },
 
     // ── Piece exchange ─────────────────────────────────────────────────
-
     /// Request specific coded pieces for a content identifier.
     PieceRequest {
         /// The CID whose pieces are being requested.
@@ -51,7 +49,6 @@ pub enum WireMessage {
     },
 
     // ── Discovery ─────────────────────────────────────────────────────
-
     /// Announce that this node stores pieces for `cid`.
     ProviderAnnounce {
         /// The announced CID.
@@ -61,7 +58,6 @@ pub enum WireMessage {
     },
 
     // ── Mutable data ──────────────────────────────────────────────────
-
     /// A signed write to mutable content-addressed storage.
     SignedWrite {
         /// Serialized payload (opaque bytes).
@@ -75,7 +71,6 @@ pub enum WireMessage {
     },
 
     // ── SWIM gossip ───────────────────────────────────────────────────
-
     /// A node joining the SWIM membership ring.
     SwimJoin {
         /// Node that is joining.
@@ -113,7 +108,6 @@ pub enum WireMessage {
     },
 
     // ── Health ────────────────────────────────────────────────────────
-
     /// Report the replication health of a stored CID.
     HealthReport {
         /// The CID being reported on.
@@ -125,7 +119,6 @@ pub enum WireMessage {
     },
 
     // ── SWIM probe ────────────────────────────────────────────────────
-
     /// SWIM probe ping with piggybacked membership gossip.
     SwimPing {
         /// The node sending the ping.
@@ -161,9 +154,8 @@ impl WireMessage {
 /// over a length-prefixed QUIC stream.
 pub fn encode(msg: &WireMessage) -> Result<Vec<u8>> {
     trace!(msg_variant = ?std::mem::discriminant(msg), "encoding WireMessage");
-    let bytes = postcard::to_allocvec(msg).map_err(|e| {
-        CraftecError::SerializationError(format!("postcard encode error: {e}"))
-    })?;
+    let bytes = postcard::to_allocvec(msg)
+        .map_err(|e| CraftecError::SerializationError(format!("postcard encode error: {e}")))?;
     debug!(
         msg_variant = ?std::mem::discriminant(msg),
         encoded_len = bytes.len(),
@@ -175,9 +167,8 @@ pub fn encode(msg: &WireMessage) -> Result<Vec<u8>> {
 /// Decode a [`WireMessage`] from bytes using [postcard].
 pub fn decode(data: &[u8]) -> Result<WireMessage> {
     trace!(data_len = data.len(), "decoding WireMessage");
-    let msg: WireMessage = postcard::from_bytes(data).map_err(|e| {
-        CraftecError::SerializationError(format!("postcard decode error: {e}"))
-    })?;
+    let msg: WireMessage = postcard::from_bytes(data)
+        .map_err(|e| CraftecError::SerializationError(format!("postcard decode error: {e}")))?;
     debug!(
         msg_variant = ?std::mem::discriminant(&msg),
         "decoded WireMessage"
@@ -212,7 +203,10 @@ mod tests {
         let bytes = encode(&msg).unwrap();
         let decoded = decode(&bytes).unwrap();
         match decoded {
-            WireMessage::PieceRequest { cid: c, piece_indices } => {
+            WireMessage::PieceRequest {
+                cid: c,
+                piece_indices,
+            } => {
                 assert_eq!(c, cid);
                 assert_eq!(piece_indices, vec![0, 1, 2]);
             }

@@ -21,8 +21,11 @@
 use std::collections::HashSet;
 
 use dashmap::DashMap;
+use rand::seq::SliceRandom;
 
-use craftec_types::{Cid, NodeId};
+use craftec_types::{Cid, NodeId, WireMessage};
+
+use crate::endpoint::CraftecEndpoint;
 
 // ── Main type ──────────────────────────────────────────────────────────────
 
@@ -114,11 +117,50 @@ impl DhtProviders {
 
     /// Return the total number of (CID, provider) pairs tracked.
     pub fn provider_count(&self) -> usize {
-        self.local_providers
-            .iter()
-            .map(|e| e.value().len())
-            .sum()
+        self.local_providers.iter().map(|e| e.value().len()).sum()
     }
+}
+
+/// Broadcast a [`WireMessage::ProviderAnnounce`] for `cid` to `log(N)` random alive peers.
+///
+/// Used after a CID is written locally to inform the network that this node holds it.
+pub async fn announce_cid_to_peers(cid: &Cid, local_id: &NodeId, endpoint: &CraftecEndpoint) {
+    let alive_peers = endpoint.swim().alive_members();
+    if alive_peers.is_empty() {
+        return;
+    }
+
+    let count = ((alive_peers.len() as f64).ln().ceil() as usize).max(1);
+    // Scope the non-Send ThreadRng so it's dropped before any .await.
+    let targets: Vec<NodeId> = {
+        let mut rng = rand::thread_rng();
+        alive_peers
+            .choose_multiple(&mut rng, count.min(alive_peers.len()))
+            .copied()
+            .collect()
+    };
+
+    let msg = WireMessage::ProviderAnnounce {
+        cid: *cid,
+        node_id: *local_id,
+    };
+
+    for target in &targets {
+        if let Err(e) = endpoint.send_message(target, &msg).await {
+            tracing::debug!(
+                cid = %cid,
+                peer = %target,
+                error = %e,
+                "DHT: failed to announce to peer"
+            );
+        }
+    }
+
+    tracing::debug!(
+        cid = %cid,
+        announced_to = targets.len(),
+        "DHT: CID announced to peers"
+    );
 }
 
 #[cfg(test)]

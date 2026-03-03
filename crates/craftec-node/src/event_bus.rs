@@ -33,8 +33,8 @@
 //! `EventBus` is `Clone + Send + Sync`.  The inner `broadcast::Sender` is
 //! reference-counted by Tokio, so all clones share the same channel.
 
-use tokio::sync::broadcast;
 use craftec_types::event::Event;
+use tokio::sync::broadcast;
 
 /// Bounded broadcast event bus.
 ///
@@ -94,6 +94,7 @@ impl EventBus {
     /// Return the number of active receivers on this bus.
     ///
     /// Useful for diagnostics and health checks.
+    #[allow(dead_code)]
     pub fn receiver_count(&self) -> usize {
         self.sender.receiver_count()
     }

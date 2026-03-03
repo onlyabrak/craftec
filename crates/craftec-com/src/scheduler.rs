@@ -96,11 +96,25 @@ impl ProgramState {
 impl std::fmt::Display for ProgramState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ProgramState::Loaded { wasm_cid, loaded_at } => {
-                write!(f, "Loaded(wasm={wasm_cid}, age={}ms)", loaded_at.elapsed().as_millis())
+            ProgramState::Loaded {
+                wasm_cid,
+                loaded_at,
+            } => {
+                write!(
+                    f,
+                    "Loaded(wasm={wasm_cid}, age={}ms)",
+                    loaded_at.elapsed().as_millis()
+                )
             }
-            ProgramState::Running { wasm_cid, started_at } => {
-                write!(f, "Running(wasm={wasm_cid}, uptime={}ms)", started_at.elapsed().as_millis())
+            ProgramState::Running {
+                wasm_cid,
+                started_at,
+            } => {
+                write!(
+                    f,
+                    "Running(wasm={wasm_cid}, uptime={}ms)",
+                    started_at.elapsed().as_millis()
+                )
             }
             ProgramState::Stopped { wasm_cid, reason } => {
                 write!(f, "Stopped(wasm={wasm_cid}, reason={reason})")
@@ -349,7 +363,10 @@ mod tests {
         // Stop.
         sched.stop_program(&id, "test complete").await.unwrap();
         assert!(!sched.is_running(&id));
-        assert!(matches!(sched.state(&id), Some(ProgramState::Stopped { .. })));
+        assert!(matches!(
+            sched.state(&id),
+            Some(ProgramState::Stopped { .. })
+        ));
     }
 
     #[tokio::test]

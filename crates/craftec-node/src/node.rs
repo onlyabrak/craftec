@@ -46,22 +46,27 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tokio::sync::broadcast;
 
+use craftec_com::DEFAULT_FUEL_LIMIT;
 use craftec_com::runtime::ComRuntime;
 use craftec_com::scheduler::ProgramScheduler;
-use craftec_com::DEFAULT_FUEL_LIMIT;
 use craftec_crypto::sign::KeyStore;
+use craftec_health::repair::RepairExecutor;
 use craftec_health::scanner::HealthScanner;
 use craftec_health::tracker::PieceTracker;
-use craftec_net::connection::HandlerFuture;
+use craftec_net::dht::DhtProviders;
 use craftec_net::endpoint::CraftecEndpoint;
-use craftec_net::swim::{run_swim_loop, SwimMembership};
+use craftec_net::swim::{SwimMembership, run_swim_loop};
 use craftec_obj::ContentAddressedStore;
 use craftec_rlnc::engine::RlncEngine;
+use craftec_sql::CraftDatabase;
+use craftec_sql::RpcWriteHandler;
 use craftec_types::config::NodeConfig;
 use craftec_types::identity::NodeKeypair;
 use craftec_vfs::CidVfs;
 
 use crate::event_bus::EventBus;
+use crate::handler::NodeMessageHandler;
+use crate::pending::PendingFetches;
 use crate::shutdown::wait_for_shutdown;
 
 /// LRU cache capacity for the CraftOBJ content-addressed store.
@@ -83,6 +88,7 @@ const NODE_LOCK_FILENAME: &str = "node.lock";
 /// Constructed via [`CraftecNode::new`], which initialises every subsystem in
 /// dependency order.  Call [`CraftecNode::run`] to bootstrap into the network
 /// and block until a shutdown signal is received.
+#[allow(dead_code)]
 pub struct CraftecNode {
     /// Parsed, validated node configuration.
     config: NodeConfig,
@@ -94,10 +100,18 @@ pub struct CraftecNode {
     rlnc: Arc<RlncEngine>,
     /// CID-based virtual file system for SQLite.
     vfs: Arc<CidVfs>,
+    /// The node's own CraftSQL database.
+    database: Arc<CraftDatabase>,
+    /// RPC write handler for processing signed writes from remote nodes.
+    rpc_write_handler: Arc<RpcWriteHandler>,
     /// QUIC/iroh P2P endpoint.
     endpoint: Arc<CraftecEndpoint>,
     /// SWIM membership table.
     swim: Arc<SwimMembership>,
+    /// DHT provider record table.
+    dht: Arc<DhtProviders>,
+    /// Rendezvous point for in-flight piece fetches.
+    pending_fetches: Arc<PendingFetches>,
     /// Background CID health scanner.
     health_scanner: Arc<HealthScanner>,
     /// Live coded-piece availability tracker.
@@ -152,8 +166,7 @@ impl CraftecNode {
 
         // ── Step 3: Initialize KeyStore ───────────────────────────────────────
         tracing::info!("Step 3: initializing KeyStore (Ed25519 keypair)...");
-        let keystore = KeyStore::new(&config.data_dir)
-            .context("failed to initialise KeyStore")?;
+        let keystore = KeyStore::new(&config.data_dir).context("failed to initialise KeyStore")?;
         tracing::info!(
             node_id = %keystore.node_id(),
             "KeyStore ready"
@@ -180,11 +193,24 @@ impl CraftecNode {
         );
         tracing::info!(page_size = config.page_size, "CID-VFS ready");
 
+        // ── Step 6b: Initialize CraftSQL database ────────────────────────
+        tracing::info!("Step 6b: initializing CraftSQL database...");
+        let database = Arc::new(
+            CraftDatabase::create(keystore.node_id(), Arc::clone(&vfs))
+                .await
+                .context("failed to initialise CraftDatabase")?,
+        );
+        let rpc_write_handler = Arc::new(RpcWriteHandler::new(Arc::clone(&database)));
+        tracing::info!(
+            owner = %keystore.node_id(),
+            root_cid = %database.root_cid(),
+            "CraftSQL database ready"
+        );
+
         // ── Step 7: Initialize CraftCOM runtime ──────────────────────────────
         tracing::info!("Step 7: initializing CraftCOM Wasmtime runtime...");
         let com_runtime = Arc::new(
-            ComRuntime::new(DEFAULT_FUEL_LIMIT)
-                .context("failed to initialise ComRuntime")?,
+            ComRuntime::new(DEFAULT_FUEL_LIMIT).context("failed to initialise ComRuntime")?,
         );
         tracing::info!(fuel_limit = DEFAULT_FUEL_LIMIT, "ComRuntime ready");
 
@@ -200,8 +226,9 @@ impl CraftecNode {
             let secret = {
                 // Re-open the key file to read the raw bytes for iroh.
                 let key_path = config.data_dir.join("node.key");
-                let bytes = std::fs::read(&key_path)
-                    .with_context(|| format!("failed to read node.key at {}", key_path.display()))?;
+                let bytes = std::fs::read(&key_path).with_context(|| {
+                    format!("failed to read node.key at {}", key_path.display())
+                })?;
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(&bytes);
                 arr
@@ -219,19 +246,20 @@ impl CraftecNode {
             "CraftecEndpoint ready"
         );
 
-        // ── Step 10: Initialize SWIM membership ──────────────────────────────
-        tracing::info!("Step 10: initializing SWIM membership...");
+        // ── Step 10: Initialize SWIM membership + DHT ─────────────────────────
+        tracing::info!("Step 10: initializing SWIM membership and DHT providers...");
         let swim = endpoint.swim().clone();
+        let dht = Arc::new(DhtProviders::new());
+        let pending_fetches = Arc::new(PendingFetches::new());
         tracing::info!(
             local_id = %keystore.node_id(),
-            "SWIM membership ready"
+            "SWIM membership, DHT providers, and PendingFetches ready"
         );
 
         // ── Step 11: Initialize HealthScanner + PieceTracker ─────────────────
         tracing::info!("Step 11: initializing HealthScanner and PieceTracker...");
         let piece_tracker = Arc::new(PieceTracker::new());
-        let health_interval =
-            Duration::from_secs(config.health_scan_interval_secs);
+        let health_interval = Duration::from_secs(config.health_scan_interval_secs);
         let health_scanner = Arc::new(HealthScanner::new(
             Arc::clone(&store),
             Arc::clone(&piece_tracker),
@@ -262,8 +290,12 @@ impl CraftecNode {
             store,
             rlnc,
             vfs,
+            database,
+            rpc_write_handler,
             endpoint,
             swim,
+            dht,
+            pending_fetches,
             health_scanner,
             piece_tracker,
             com_runtime,
@@ -307,26 +339,51 @@ impl CraftecNode {
             tracing::info!("No bootstrap peers configured — starting in isolated mode");
         }
 
+        // ── Storage bootstrap: announce locally-held CIDs to DHT ──────────────
+        {
+            let store = Arc::clone(&self.store);
+            let endpoint = Arc::clone(&self.endpoint);
+            let node_id = *self.endpoint.node_id();
+            tokio::spawn(async move {
+                match store.list_cids().await {
+                    Ok(cids) => {
+                        tracing::info!(
+                            count = cids.len(),
+                            "Storage bootstrap: announcing locally-held CIDs"
+                        );
+                        for cid in &cids {
+                            craftec_net::dht::announce_cid_to_peers(cid, &node_id, &endpoint).await;
+                        }
+                        tracing::info!(
+                            count = cids.len(),
+                            "Storage bootstrap: CID announcements complete"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "Storage bootstrap: failed to list CIDs"
+                        );
+                    }
+                }
+            });
+        }
+        tracing::info!("Storage bootstrap spawned");
+
         // ── Spawn: accept loop ────────────────────────────────────────────────
         {
             let endpoint = Arc::clone(&self.endpoint);
             let mut shutdown_rx = self.shutdown_tx.subscribe();
+            let handler = Arc::new(NodeMessageHandler::new(
+                Arc::clone(&self.store),
+                Arc::clone(&self.piece_tracker),
+                Arc::clone(&self.dht),
+                Arc::clone(&self.pending_fetches),
+                Arc::clone(&self.rpc_write_handler),
+                *self.endpoint.node_id(),
+            ));
             tokio::spawn(async move {
                 tracing::info!("Accept loop: starting...");
-                // A no-op handler that logs and discards all inbound messages.
-                // Subsystems register their own handlers in a future refactor.
-                struct LoggingHandler;
-                impl craftec_net::ConnectionHandler for LoggingHandler {
-                    fn handle_message(
-                        &self,
-                        from: craftec_types::NodeId,
-                        msg: craftec_types::WireMessage,
-                    ) -> HandlerFuture {
-                        tracing::debug!(peer = %from, msg = ?msg, "Accept loop: inbound message");
-                        Box::pin(async move { None })
-                    }
-                }
-                let handler = Arc::new(LoggingHandler);
                 tokio::select! {
                     _ = endpoint.accept_loop(handler) => {
                         tracing::info!("Accept loop: endpoint closed");
@@ -342,32 +399,70 @@ impl CraftecNode {
         // ── Spawn: SWIM membership loop ───────────────────────────────────────
         {
             let swim = Arc::clone(&self.swim);
+            let endpoint = Arc::clone(&self.endpoint);
             let shutdown_rx = self.shutdown_tx.subscribe();
             tokio::spawn(async move {
                 tracing::info!("SWIM loop: starting...");
-                run_swim_loop(swim, shutdown_rx).await;
+                run_swim_loop(swim, endpoint, shutdown_rx).await;
                 tracing::info!("SWIM loop: stopped");
             });
         }
         tracing::info!("SWIM loop spawned");
 
-        // ── Spawn: health scan loop ───────────────────────────────────────────
+        // ── Spawn: health scan + repair executor ─────────────────────────────
         {
+            let (repair_tx, mut repair_rx) = tokio::sync::mpsc::channel(128);
+
+            // Scanner task: emits RepairRequests into repair_tx.
             let health_scanner = Arc::clone(&self.health_scanner);
             let shutdown_rx = self.shutdown_tx.subscribe();
             tokio::spawn(async move {
                 tracing::info!("Health scan loop: starting...");
-                health_scanner.run(shutdown_rx).await;
+                health_scanner.run(repair_tx, shutdown_rx).await;
                 tracing::info!("Health scan loop: stopped");
             });
+
+            // Repair executor task: consumes RepairRequests from repair_rx.
+            let repair_executor = RepairExecutor::new(
+                Arc::clone(&self.rlnc),
+                Arc::clone(&self.endpoint),
+                Arc::clone(&self.piece_tracker),
+                Arc::clone(&self.pending_fetches),
+            );
+            let mut repair_shutdown = self.shutdown_tx.subscribe();
+            tokio::spawn(async move {
+                tracing::info!("Repair executor: starting...");
+                loop {
+                    tokio::select! {
+                        Some(request) = repair_rx.recv() => {
+                            if let Err(e) = repair_executor.execute_repair(&request).await {
+                                tracing::warn!(
+                                    cid = %request.cid(),
+                                    error = %e,
+                                    "Repair executor: repair failed"
+                                );
+                            }
+                        }
+                        _ = repair_shutdown.recv() => {
+                            tracing::info!("Repair executor: shutdown signal received");
+                            break;
+                        }
+                    }
+                }
+                tracing::info!("Repair executor: stopped");
+            });
         }
-        tracing::info!("Health scan loop spawned");
+        tracing::info!("Health scan + repair executor spawned");
 
         // ── Spawn: event bus dispatch loop ────────────────────────────────────
         {
             let event_bus = Arc::clone(&self.event_bus);
             let mut event_rx = event_bus.subscribe();
             let mut shutdown_rx = self.shutdown_tx.subscribe();
+            let endpoint = Arc::clone(&self.endpoint);
+            let piece_tracker = Arc::clone(&self.piece_tracker);
+            let dht = Arc::clone(&self.dht);
+            let node_id = *self.endpoint.node_id();
             tokio::spawn(async move {
                 tracing::info!("Event dispatch loop: starting...");
                 loop {
@@ -376,8 +471,43 @@ impl CraftecNode {
                             match result {
                                 Ok(event) => {
                                     tracing::debug!(event = ?event, "Event bus dispatch");
-                                    // Subsystems subscribe directly; this loop
-                                    // is for central logging / diagnostics only.
+                                    match event {
+                                        craftec_types::Event::CidWritten { cid } => {
+                                            craftec_net::dht::announce_cid_to_peers(
+                                                &cid, &node_id, &endpoint,
+                                            ).await;
+                                        }
+                                        craftec_types::Event::PeerConnected { node_id } => {
+                                            tracing::info!(peer = %node_id, "Event: peer connected");
+                                        }
+                                        craftec_types::Event::PeerDisconnected { node_id } => {
+                                            tracing::info!(peer = %node_id, "Event: peer disconnected");
+                                            piece_tracker.remove_node(&node_id);
+                                            dht.remove_node(&node_id);
+                                        }
+                                        craftec_types::Event::RepairNeeded { .. } => {
+                                            // Repair is handled via the scanner→executor channel.
+                                            tracing::debug!("Event: repair needed (handled by scanner)");
+                                        }
+                                        craftec_types::Event::DiskWatermarkHit { usage_percent } => {
+                                            tracing::warn!(
+                                                usage = usage_percent,
+                                                "Event: disk watermark hit — eviction agent pending"
+                                            );
+                                        }
+                                        craftec_types::Event::PageCommitted { db_id, page_num, root_cid } => {
+                                            tracing::debug!(
+                                                db_id = %db_id,
+                                                page_num,
+                                                root_cid = %root_cid,
+                                                "Event: page committed"
+                                            );
+                                        }
+                                        craftec_types::Event::ShutdownSignal => {
+                                            tracing::info!("Event dispatch loop: ShutdownSignal received");
+                                            break;
+                                        }
+                                    }
                                 }
                                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                                     tracing::warn!(
@@ -416,7 +546,8 @@ impl CraftecNode {
         tracing::info!("Graceful shutdown initiated...");
 
         // Publish ShutdownSignal event to inform any event-bus subscribers.
-        self.event_bus.publish(craftec_types::event::Event::ShutdownSignal);
+        self.event_bus
+            .publish(craftec_types::event::Event::ShutdownSignal);
 
         // Broadcast shutdown to all background tasks.
         let _ = self.shutdown_tx.send(());
@@ -445,60 +576,96 @@ impl CraftecNode {
     // ── Accessors ─────────────────────────────────────────────────────────────
 
     /// The node's configuration.
+    #[allow(dead_code)]
     pub fn config(&self) -> &NodeConfig {
         &self.config
     }
 
+    #[allow(dead_code)]
     /// The node's [`KeyStore`] (Ed25519 identity).
     pub fn keystore(&self) -> &KeyStore {
         &self.keystore
     }
 
+    #[allow(dead_code)]
     /// The content-addressed object store.
     pub fn store(&self) -> &Arc<ContentAddressedStore> {
         &self.store
     }
 
+    #[allow(dead_code)]
     /// The RLNC coding engine.
     pub fn rlnc(&self) -> &Arc<RlncEngine> {
         &self.rlnc
     }
 
+    #[allow(dead_code)]
     /// The CID virtual file system.
     pub fn vfs(&self) -> &Arc<CidVfs> {
         &self.vfs
     }
 
+    #[allow(dead_code)]
+    /// The node's CraftSQL database.
+    pub fn database(&self) -> &Arc<CraftDatabase> {
+        &self.database
+    }
+
+    #[allow(dead_code)]
+    /// The RPC write handler for signed writes.
+    pub fn rpc_write_handler(&self) -> &Arc<RpcWriteHandler> {
+        &self.rpc_write_handler
+    }
+
+    #[allow(dead_code)]
     /// The QUIC network endpoint.
     pub fn endpoint(&self) -> &Arc<CraftecEndpoint> {
         &self.endpoint
     }
 
+    #[allow(dead_code)]
     /// The SWIM membership table.
     pub fn swim(&self) -> &Arc<SwimMembership> {
         &self.swim
     }
 
+    #[allow(dead_code)]
+    /// The DHT provider record table.
+    pub fn dht(&self) -> &Arc<DhtProviders> {
+        &self.dht
+    }
+
+    #[allow(dead_code)]
+    /// The pending piece fetches rendezvous point.
+    pub fn pending_fetches(&self) -> &Arc<PendingFetches> {
+        &self.pending_fetches
+    }
+
+    #[allow(dead_code)]
     /// The health scanner.
     pub fn health_scanner(&self) -> &Arc<HealthScanner> {
         &self.health_scanner
     }
 
+    #[allow(dead_code)]
     /// The piece availability tracker.
     pub fn piece_tracker(&self) -> &Arc<PieceTracker> {
         &self.piece_tracker
     }
 
+    #[allow(dead_code)]
     /// The Wasmtime agent execution runtime.
     pub fn com_runtime(&self) -> &Arc<ComRuntime> {
         &self.com_runtime
     }
 
+    #[allow(dead_code)]
     /// The WASM program lifecycle scheduler.
     pub fn scheduler(&self) -> &Arc<ProgramScheduler> {
         &self.scheduler
     }
 
+    #[allow(dead_code)]
     /// The internal event bus.
     pub fn event_bus(&self) -> &Arc<EventBus> {
         &self.event_bus

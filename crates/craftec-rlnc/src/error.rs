@@ -100,8 +100,14 @@ mod tests {
 
     #[test]
     fn invalid_piece_size_display() {
-        let e = RlncError::InvalidPieceSize { expected: 1024, got: 512 };
-        assert_eq!(e.to_string(), "invalid piece size: expected 1024 bytes, got 512");
+        let e = RlncError::InvalidPieceSize {
+            expected: 1024,
+            got: 512,
+        };
+        assert_eq!(
+            e.to_string(),
+            "invalid piece size: expected 1024 bytes, got 512"
+        );
     }
 
     #[test]
@@ -112,7 +118,10 @@ mod tests {
 
     #[test]
     fn coding_vector_mismatch_display() {
-        let e = RlncError::CodingVectorLengthMismatch { expected: 32, got: 16 };
+        let e = RlncError::CodingVectorLengthMismatch {
+            expected: 32,
+            got: 16,
+        };
         assert!(e.to_string().contains("16"));
     }
 

@@ -12,5 +12,5 @@ pub mod sign;
 
 // Convenience re-exports.
 pub use hash::{hash_bytes, hash_page, merkle_root, verify_cid};
-pub use hommac::{combine_tags, compute_tag, verify_tag, HomMacKey};
+pub use hommac::{HomMacKey, combine_tags, compute_tag, verify_tag};
 pub use sign::KeyStore;

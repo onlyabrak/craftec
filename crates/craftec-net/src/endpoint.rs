@@ -194,9 +194,8 @@ impl CraftecEndpoint {
         );
 
         // Serialize first — cheap to fail before touching the network.
-        let bytes = postcard::to_allocvec(msg).map_err(|e| {
-            NetError::SerializationError(format!("postcard encode failed: {e}"))
-        })?;
+        let bytes = postcard::to_allocvec(msg)
+            .map_err(|e| NetError::SerializationError(format!("postcard encode failed: {e}")))?;
 
         // Try the connection pool first.
         let conn = if let Some(cached) = self.connections.get(peer) {
@@ -205,7 +204,7 @@ impl CraftecEndpoint {
             // We need an EndpointAddr to dial.  Connect with just the EndpointId
             // (iroh resolves it via DNS discovery if configured).
             let addr = iroh::EndpointAddr::from(
-                iroh::PublicKey::from_bytes(peer.as_bytes()).expect("valid 32-byte key")
+                iroh::PublicKey::from_bytes(peer.as_bytes()).expect("valid 32-byte key"),
             );
             let fresh = self.connect(addr).await?;
             self.connections.insert(*peer, fresh.clone());
@@ -213,12 +212,13 @@ impl CraftecEndpoint {
         };
 
         // Open a uni-directional stream — fire and forget semantics.
-        let mut send_stream = conn.open_uni().await.map_err(|e| {
-            NetError::ConnectionFailed {
+        let mut send_stream = conn
+            .open_uni()
+            .await
+            .map_err(|e| NetError::ConnectionFailed {
                 peer: peer.to_string(),
                 reason: format!("open_uni failed: {e}"),
-            }
-        })?;
+            })?;
 
         send_stream
             .write_all(&bytes)
@@ -228,10 +228,12 @@ impl CraftecEndpoint {
                 reason: format!("write_all failed: {e}"),
             })?;
 
-        send_stream.finish().map_err(|e| NetError::ConnectionFailed {
-            peer: peer.to_string(),
-            reason: format!("stream finish failed: {e}"),
-        })?;
+        send_stream
+            .finish()
+            .map_err(|e| NetError::ConnectionFailed {
+                peer: peer.to_string(),
+                reason: format!("stream finish failed: {e}"),
+            })?;
 
         tracing::debug!(
             dest = %peer,
@@ -436,9 +438,26 @@ impl CraftecEndpoint {
                                 "CraftecEndpoint: received message"
                             );
                             // Dispatch to the application-layer handler.
-                            // Replies are dropped here — full wiring sends them
-                            // via send_message if the handler returns Some(reply).
-                            let _reply = handler.handle_message(remote, msg).await;
+                            if let Some(reply) = handler.handle_message(remote, msg).await {
+                                match postcard::to_allocvec(&reply) {
+                                    Ok(reply_bytes) => match conn.open_uni().await {
+                                        Ok(mut send_stream) => {
+                                            if let Err(e) =
+                                                send_stream.write_all(&reply_bytes).await
+                                            {
+                                                tracing::debug!(peer = %remote, error = %e, "CraftecEndpoint: reply write failed");
+                                            }
+                                            let _ = send_stream.finish();
+                                        }
+                                        Err(e) => {
+                                            tracing::debug!(peer = %remote, error = %e, "CraftecEndpoint: reply stream open failed");
+                                        }
+                                    },
+                                    Err(e) => {
+                                        tracing::warn!(peer = %remote, error = %e, "CraftecEndpoint: reply serialization failed");
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -473,21 +492,37 @@ impl CraftecEndpoint {
             };
 
             match stream.read_to_end(64 * 1024).await {
-                Ok(bytes) => {
-                    match postcard::from_bytes::<WireMessage>(&bytes) {
-                        Ok(msg) => {
-                            let _responses = swim.handle_message(&msg);
-                            // Responses would be dispatched back via send_message.
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                peer = %remote,
-                                error = %e,
-                                "CraftecEndpoint: SWIM deserialization error"
-                            );
+                Ok(bytes) => match postcard::from_bytes::<WireMessage>(&bytes) {
+                    Ok(msg) => {
+                        let responses = swim.handle_message(&msg);
+                        for response in &responses {
+                            match postcard::to_allocvec(response) {
+                                Ok(resp_bytes) => match conn.open_uni().await {
+                                    Ok(mut send_stream) => {
+                                        if let Err(e) = send_stream.write_all(&resp_bytes).await {
+                                            tracing::debug!(peer = %remote, error = %e, "CraftecEndpoint: SWIM response write failed");
+                                        }
+                                        let _ = send_stream.finish();
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!(peer = %remote, error = %e, "CraftecEndpoint: SWIM response stream open failed");
+                                        break;
+                                    }
+                                },
+                                Err(e) => {
+                                    tracing::warn!(peer = %remote, error = %e, "CraftecEndpoint: SWIM response serialization failed");
+                                }
+                            }
                         }
                     }
-                }
+                    Err(e) => {
+                        tracing::warn!(
+                            peer = %remote,
+                            error = %e,
+                            "CraftecEndpoint: SWIM deserialization error"
+                        );
+                    }
+                },
                 Err(e) => {
                     tracing::warn!(peer = %remote, error = %e, "CraftecEndpoint: SWIM stream read error");
                     break;
@@ -503,14 +538,8 @@ mod tests {
 
     #[test]
     fn alpn_constants_are_valid_utf8() {
-        assert_eq!(
-            std::str::from_utf8(ALPN_CRAFTEC).unwrap(),
-            "craftec/0.1"
-        );
-        assert_eq!(
-            std::str::from_utf8(ALPN_SWIM).unwrap(),
-            "craftec-swim/0.1"
-        );
+        assert_eq!(std::str::from_utf8(ALPN_CRAFTEC).unwrap(), "craftec/0.1");
+        assert_eq!(std::str::from_utf8(ALPN_SWIM).unwrap(), "craftec-swim/0.1");
     }
 
     #[test]

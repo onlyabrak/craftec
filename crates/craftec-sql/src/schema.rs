@@ -52,10 +52,12 @@ pub async fn migrate(db: &CraftDatabase, owner: &NodeId, migration_sql: &str) ->
         "CraftSQL: applying schema migration",
     );
 
-    db.execute(migration_sql, owner).await.map_err(|e| match e {
-        SqlError::UnauthorizedWriter { .. } => e,
-        other => SqlError::MigrationFailed(other.to_string()),
-    })?;
+    db.execute(migration_sql, owner)
+        .await
+        .map_err(|e| match e {
+            SqlError::UnauthorizedWriter { .. } => e,
+            other => SqlError::MigrationFailed(other.to_string()),
+        })?;
 
     tracing::info!(
         db_id = %db.db_id(),

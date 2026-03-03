@@ -96,7 +96,7 @@ impl RlncEncoder {
         let piece_size = if total == 0 {
             1
         } else {
-            (total + k as usize - 1) / k as usize
+            total.div_ceil(k as usize)
         };
 
         // Split data into K pieces, padding the last one with zeros.
@@ -211,12 +211,7 @@ impl RlncEncoder {
     ///
     /// * `n` — number of coded pieces to produce.
     pub fn encode_n(&self, n: usize) -> Vec<CodedPiece> {
-        info!(
-            n = n,
-            k = self.k,
-            "RLNC: batch encoding {} pieces",
-            n
-        );
+        info!(n = n, k = self.k, "RLNC: batch encoding {} pieces", n);
         (0..n).map(|_| self.encode_piece()).collect()
     }
 }
@@ -264,7 +259,10 @@ mod tests {
         assert_eq!(piece.cid, enc.cid);
         assert_eq!(piece.coding_vector.len(), enc.k() as usize);
         assert_eq!(piece.data.len(), enc.piece_size());
-        assert!(piece.verify_piece_id(), "piece_id should match BLAKE3(data)");
+        assert!(
+            piece.verify_piece_id(),
+            "piece_id should match BLAKE3(data)"
+        );
         assert!(piece.verify_mac(), "HomMAC tag should verify");
     }
 

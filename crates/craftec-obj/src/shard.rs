@@ -170,7 +170,13 @@ mod tests {
         let hex = cid.to_string();
 
         // Parent directory name == first two hex chars of CID
-        let parent_name = path.parent().unwrap().file_name().unwrap().to_str().unwrap();
+        let parent_name = path
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert_eq!(parent_name, &hex[..2]);
     }
 

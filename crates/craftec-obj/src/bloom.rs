@@ -74,8 +74,7 @@ impl CidBloomFilter {
     pub fn new(expected_items: usize, fp_rate: f64) -> Self {
         trace!(
             expected_items,
-            fp_rate,
-            "CraftOBJ bloom: constructing new filter"
+            fp_rate, "CraftOBJ bloom: constructing new filter"
         );
         let inner = Bloom::new_for_fp_rate(expected_items, fp_rate);
         CidBloomFilter { inner, count: 0 }
@@ -166,7 +165,10 @@ mod tests {
     fn insert_then_probably_contains() {
         let mut f = CidBloomFilter::new(100, 0.01);
         let cid = make_cid(b"hello");
-        assert!(!f.probably_contains(&cid), "empty filter should return false");
+        assert!(
+            !f.probably_contains(&cid),
+            "empty filter should return false"
+        );
         f.insert(&cid);
         assert!(f.probably_contains(&cid), "inserted CID must be found");
     }

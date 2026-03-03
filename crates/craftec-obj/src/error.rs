@@ -82,7 +82,10 @@ mod tests {
         };
         let s = err.to_string();
         assert!(s.contains("deadbeef"), "display should include CID");
-        assert!(s.contains("hash mismatch"), "display should include message");
+        assert!(
+            s.contains("hash mismatch"),
+            "display should include message"
+        );
     }
 
     #[test]

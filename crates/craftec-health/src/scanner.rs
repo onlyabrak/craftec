@@ -52,6 +52,7 @@ fn target_piece_count(k: u32) -> u32 {
 /// CID whose piece availability has fallen below the redundancy target.
 pub struct HealthScanner {
     /// The underlying content-addressed store — source of the CID list.
+    #[allow(dead_code)]
     store: Arc<ContentAddressedStore>,
     /// Fraction of all CIDs to scan per cycle (default `0.01` = 1%).
     scan_percent: f64,
@@ -159,12 +160,13 @@ impl HealthScanner {
 
     /// Run the scanner indefinitely, sleeping `interval / 100` between cycles.
     ///
-    /// Exits cleanly when `shutdown` receives a signal.
-    ///
-    /// In production, the returned [`RepairRequest`]s should be forwarded to a
-    /// [`RepairExecutor`] via a channel.  This method logs them instead.
-    pub async fn run(&self, mut shutdown: tokio::sync::broadcast::Receiver<()>) {
-        // Cycle sleep = total interval divided into 100 equal slices.
+    /// Emitted [`RepairRequest`]s are forwarded to `repair_tx` for the
+    /// [`RepairExecutor`] to process.  Exits cleanly on shutdown signal.
+    pub async fn run(
+        &self,
+        repair_tx: tokio::sync::mpsc::Sender<RepairRequest>,
+        mut shutdown: tokio::sync::broadcast::Receiver<()>,
+    ) {
         let cycle_sleep = self.interval.div_f64(100.0);
 
         tracing::info!(
@@ -177,12 +179,16 @@ impl HealthScanner {
                 _ = tokio::time::sleep(cycle_sleep) => {
                     match self.scan_cycle().await {
                         Ok(repairs) => {
-                            for req in &repairs {
+                            for req in repairs {
                                 tracing::warn!(
                                     cid = %req.cid(),
                                     severity = req.severity(),
                                     "HealthScan: repair needed"
                                 );
+                                if repair_tx.send(req).await.is_err() {
+                                    tracing::warn!("HealthScanner: repair channel closed");
+                                    return;
+                                }
                             }
                         }
                         Err(e) => {

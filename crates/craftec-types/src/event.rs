@@ -122,7 +122,9 @@ mod tests {
             target: 10,
         };
         match ev {
-            Event::RepairNeeded { available, target, .. } => {
+            Event::RepairNeeded {
+                available, target, ..
+            } => {
                 assert_eq!(available, 5);
                 assert_eq!(target, 10);
             }

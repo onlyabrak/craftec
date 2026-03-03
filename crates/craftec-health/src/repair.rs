@@ -19,14 +19,19 @@
 //! erasure codes.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use craftec_types::{Cid, NodeId, WireMessage};
-use craftec_types::piece::CodedPiece;
 use craftec_net::CraftecEndpoint;
+use craftec_net::pending::PendingFetches;
 use craftec_rlnc::RlncEngine;
+use craftec_types::piece::CodedPiece;
+use craftec_types::{Cid, NodeId, WireMessage};
 
 use crate::error::{HealthError, Result};
 use crate::tracker::PieceTracker;
+
+/// Timeout for waiting on a piece fetch response from a peer.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ── RepairRequest ────────────────────────────────────────────────────────────
 
@@ -85,6 +90,8 @@ pub struct RepairExecutor {
     net: Arc<CraftecEndpoint>,
     /// Piece availability tracker — provides holders to fetch from and targets to send to.
     tracker: Arc<PieceTracker>,
+    /// Rendezvous point for piece fetch responses arriving via the accept loop.
+    pending: Arc<PendingFetches>,
 }
 
 impl RepairExecutor {
@@ -93,11 +100,13 @@ impl RepairExecutor {
         rlnc_engine: Arc<RlncEngine>,
         net: Arc<CraftecEndpoint>,
         tracker: Arc<PieceTracker>,
+        pending: Arc<PendingFetches>,
     ) -> Self {
         Self {
             rlnc_engine,
             net,
             tracker,
+            pending,
         }
     }
 
@@ -138,14 +147,14 @@ impl RepairExecutor {
         let pieces = self.fetch_pieces(cid, &holders, 2).await?;
 
         // Step 3: recode — combine without decoding.
-        let recoded = self
-            .rlnc_engine
-            .recode(&pieces)
-            .await
-            .map_err(|e| HealthError::RepairFailed {
-                cid: cid.to_string(),
-                reason: format!("RLNC recode failed: {e}"),
-            })?;
+        let recoded =
+            self.rlnc_engine
+                .recode(&pieces)
+                .await
+                .map_err(|e| HealthError::RepairFailed {
+                    cid: cid.to_string(),
+                    reason: format!("RLNC recode failed: {e}"),
+                })?;
 
         // Step 4: find a target peer that lacks pieces.
         let target = self.select_distribution_target(cid, &holders)?;
@@ -174,7 +183,10 @@ impl RepairExecutor {
 
     // ── Private helpers ────────────────────────────────────────────────────
 
-    /// Request `count` coded pieces from distinct holders and return the raw bytes.
+    /// Request `count` coded pieces from distinct holders via the network.
+    ///
+    /// Sends `PieceRequest` to each holder and waits for the response via
+    /// `PendingFetches` with a 10-second timeout per peer.
     async fn fetch_pieces(
         &self,
         cid: &Cid,
@@ -182,34 +194,53 @@ impl RepairExecutor {
         count: usize,
     ) -> Result<Vec<CodedPiece>> {
         let mut pieces = Vec::with_capacity(count);
-        let request_msg = WireMessage::PieceRequest { cid: *cid, piece_indices: vec![] };
+        let request_msg = WireMessage::PieceRequest {
+            cid: *cid,
+            piece_indices: vec![],
+        };
 
         for holder in holders.iter().take(count * 2) {
-            // Try up to 2× the required count to handle non-responsive peers.
             if pieces.len() >= count {
                 break;
             }
 
+            // Register interest before sending the request to avoid a race.
+            let rx = self.pending.register(cid);
+
             match self.net.send_message(&holder.node_id, &request_msg).await {
                 Ok(()) => {
-                    // In the full implementation, we'd await the response on a channel.
-                    // For now we record the fetch attempt; the actual bytes arrive
-                    // via the accept_loop and a response rendezvous mechanism.
-                    tracing::trace!(
-                        cid = %cid,
-                        peer = %holder.node_id,
-                        piece = holder.piece_index,
-                        "Repair: fetched piece"
-                    );
-                    // Placeholder: real bytes come from the wire in full implementation.
-                    pieces.push(CodedPiece::new(*cid, vec![0u8; 32], vec![0u8; 16384], [0u8; 32]));
+                    // Wait for the response with a timeout.
+                    match tokio::time::timeout(FETCH_TIMEOUT, rx).await {
+                        Ok(Ok(piece)) => {
+                            tracing::debug!(
+                                cid = %cid,
+                                peer = %holder.node_id,
+                                "Repair: fetched piece from peer"
+                            );
+                            pieces.push(piece);
+                        }
+                        Ok(Err(_)) => {
+                            tracing::debug!(
+                                cid = %cid,
+                                peer = %holder.node_id,
+                                "Repair: fetch channel closed"
+                            );
+                        }
+                        Err(_) => {
+                            tracing::debug!(
+                                cid = %cid,
+                                peer = %holder.node_id,
+                                "Repair: fetch timed out"
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
                         cid = %cid,
                         peer = %holder.node_id,
                         error = %e,
-                        "Repair: fetch from peer failed — trying next"
+                        "Repair: fetch request send failed — trying next"
                     );
                 }
             }

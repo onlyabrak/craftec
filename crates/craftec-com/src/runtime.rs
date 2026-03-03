@@ -19,10 +19,15 @@
 //! Full WASI 0.2 support is planned; current builds use component-model-free
 //! modules for simplicity.  The host ABI is stable regardless.
 
-use wasmtime::{Engine, Config, Store, Module, Linker, Val};
+use std::sync::Arc;
+
+use craftec_crypto::sign::KeyStore;
+use craftec_obj::ContentAddressedStore;
+use craftec_sql::CraftDatabase;
+use wasmtime::{Config, Engine, Linker, Module, Store, Val};
 
 use crate::error::{ComError, Result};
-use crate::host::HostFunctions;
+use crate::host::{HostFunctions, HostState};
 
 /// Default fuel limit per agent invocation: 10 million units.
 pub const DEFAULT_FUEL_LIMIT: u64 = 10_000_000;
@@ -60,8 +65,8 @@ impl ComRuntime {
         // compilation; use "speed" for long-lived agents).
         config.cranelift_opt_level(wasmtime::OptLevel::Speed);
 
-        let engine = Engine::new(&config)
-            .map_err(|e| ComError::RuntimeConfigError(e.to_string()))?;
+        let engine =
+            Engine::new(&config).map_err(|e| ComError::RuntimeConfigError(e.to_string()))?;
 
         tracing::info!(fuel_limit = fuel_limit, "CraftCOM: runtime initialized");
 
@@ -98,19 +103,20 @@ impl ComRuntime {
         wasm_bytes: &[u8],
         entry_point: &str,
         args: &[Val],
+        host_state: HostState,
     ) -> Result<Vec<Val>> {
         // Compile module.
         let module = Module::new(&self.engine, wasm_bytes)
             .map_err(|e| ComError::WasmCompilationFailed(e.to_string()))?;
 
-        // Create store with fuel.
-        let mut store = Store::new(&self.engine, ());
+        // Create store with fuel and host state.
+        let mut store = Store::new(&self.engine, host_state);
         store
             .set_fuel(self.fuel_limit)
             .map_err(|e| ComError::RuntimeConfigError(e.to_string()))?;
 
         // Link host functions.
-        let mut linker: Linker<()> = Linker::new(&self.engine);
+        let mut linker: Linker<HostState> = Linker::new(&self.engine);
         HostFunctions::register(&mut linker)?;
 
         // Instantiate.
@@ -132,8 +138,7 @@ impl ComRuntime {
         func.call(&mut store, args, &mut results).map_err(|e| {
             let err_string = e.to_string();
             if err_string.contains("fuel") || err_string.contains("Fuel") {
-                let consumed = self.fuel_limit
-                    - store.get_fuel().unwrap_or(0);
+                let consumed = self.fuel_limit - store.get_fuel().unwrap_or(0);
                 ComError::FuelExhausted {
                     consumed,
                     limit: self.fuel_limit,
@@ -162,8 +167,20 @@ impl ComRuntime {
     ///
     /// Returns `0` if fuel tracking is not active (should not happen with the
     /// standard engine config).
-    pub fn remaining_fuel(&self, store: &Store<()>) -> u64 {
+    pub fn remaining_fuel(&self, store: &Store<HostState>) -> u64 {
         store.get_fuel().unwrap_or(0)
+    }
+
+    /// Create a default [`HostState`] from the given backends.
+    ///
+    /// Convenience method for callers that need to construct state before
+    /// calling [`execute_agent`](Self::execute_agent).
+    pub fn make_host_state(
+        store: Arc<ContentAddressedStore>,
+        database: Option<Arc<CraftDatabase>>,
+        keystore: Arc<KeyStore>,
+    ) -> HostState {
+        HostState::new(store, database, keystore)
     }
 
     /// Return a reference to the inner Wasmtime [`Engine`].
@@ -179,6 +196,16 @@ impl ComRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_host_state() -> HostState {
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(ContentAddressedStore::new(tmp.path().join("obj").as_path(), 64).unwrap());
+        let keystore = Arc::new(KeyStore::new(tmp.path()).unwrap());
+        // Leak the tempdir so it survives the test (cleaned up on process exit).
+        std::mem::forget(tmp);
+        HostState::new(store, None, keystore)
+    }
 
     #[test]
     fn runtime_construction_succeeds() {
@@ -210,7 +237,8 @@ mod tests {
                     0x01, 0x00, 0x00, 0x00, // version
                     0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f, // type section: () -> i32
                     0x03, 0x02, 0x01, 0x00, // function section
-                    0x07, 0x08, 0x01, 0x04, 0x6d, 0x61, 0x69, 0x6e, 0x00, 0x00, // export "main"
+                    0x07, 0x08, 0x01, 0x04, 0x6d, 0x61, 0x69, 0x6e, 0x00,
+                    0x00, // export "main"
                     0x0a, 0x06, 0x01, 0x04, 0x00, 0x41, 0x2a, 0x0b, // code: i32.const 42
                 ]
             })
@@ -220,7 +248,8 @@ mod tests {
     async fn execute_minimal_wasm() {
         let rt = ComRuntime::new(100_000).unwrap();
         let wasm = minimal_wasm();
-        let result = rt.execute_agent(&wasm, "main", &[]).await;
+        let state = make_host_state();
+        let result = rt.execute_agent(&wasm, "main", &[], state).await;
         // If the module compiled successfully, we expect i32(42).
         // If `wat` is unavailable and the fallback binary is wrong on this
         // Wasmtime version, the test is allowed to error at compilation.
@@ -241,7 +270,8 @@ mod tests {
     async fn missing_entry_point_returns_error() {
         let rt = ComRuntime::new(100_000).unwrap();
         let wasm = minimal_wasm();
-        match rt.execute_agent(&wasm, "nonexistent", &[]).await {
+        let state = make_host_state();
+        match rt.execute_agent(&wasm, "nonexistent", &[], state).await {
             Err(ComError::EntryPointNotFound(name)) => assert_eq!(name, "nonexistent"),
             Err(ComError::WasmCompilationFailed(_)) => { /* fallback binary; skip */ }
             other => panic!("unexpected result: {other:?}"),

@@ -117,16 +117,68 @@ impl CodedPiece {
 
     /// Verify the homomorphic MAC tag using the CID as key.
     ///
-    /// Recomputes `BLAKE3(key || coding_vector || data)` using the CID bytes
-    /// as the key and compares with `hommac_tag`.
+    /// Recomputes the linear GF(2^8) inner-product MAC:
+    /// `tag[j] = Σ_i r_{j,i} * piece[i]` where piece = cv || data
+    /// and `r_j = BLAKE3_XOF(key || j)`.
+    ///
+    /// This matches `craftec_crypto::hommac::compute_tag`.
     pub fn verify_mac(&self) -> bool {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(self.cid.as_bytes());
-        hasher.update(&self.coding_vector);
-        hasher.update(&self.data);
-        let tag = *hasher.finalize().as_bytes();
+        let key = self.cid.as_bytes();
+        let mut tag = [0u8; 32];
+
+        for j in 0..32u8 {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(key);
+            hasher.update(&[j]);
+            let mut xof = hasher.finalize_xof();
+
+            let mut acc = 0u8;
+            let mut r_buf = [0u8; 256];
+
+            // Process coding_vector.
+            for cv_chunk in self.coding_vector.chunks(256) {
+                xof.fill(&mut r_buf[..cv_chunk.len()]);
+                for (r, cv) in r_buf.iter().zip(cv_chunk.iter()) {
+                    acc ^= gf256_mul_0x11b(*r, *cv);
+                }
+            }
+
+            // Process data.
+            for data_chunk in self.data.chunks(256) {
+                xof.fill(&mut r_buf[..data_chunk.len()]);
+                for (r, d) in r_buf.iter().zip(data_chunk.iter()) {
+                    acc ^= gf256_mul_0x11b(*r, *d);
+                }
+            }
+
+            tag[j as usize] = acc;
+        }
+
         tag == self.hommac_tag
     }
+}
+
+// ── GF(2^8) helper ────────────────────────────────────────────────────────
+
+/// GF(2^8) multiply using AES polynomial 0x11B.
+/// Duplicated here to avoid a circular dependency on craftec-crypto.
+#[inline]
+fn gf256_mul_0x11b(a: u8, b: u8) -> u8 {
+    let mut result: u8 = 0;
+    let mut aa = a;
+    let mut bb = b;
+    for _ in 0..8 {
+        if bb & 1 != 0 {
+            result ^= aa;
+        }
+        let high_bit = aa & 0x80;
+        aa <<= 1;
+        if high_bit != 0 {
+            aa ^= 0x1B;
+        }
+        bb >>= 1;
+    }
+    result
 }
 
 // ── PieceIndex ─────────────────────────────────────────────────────────────

@@ -11,8 +11,6 @@
 //! All tests run in-process — no external network required.
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
 
 use craftec_types::cid::Cid;
 use craftec_types::identity::{self, NodeId, NodeKeypair};
@@ -72,7 +70,10 @@ impl SimpleMembership {
                     incarnation: 0,
                 });
             }
-            WireMessage::SwimAlive { node_id, incarnation } => {
+            WireMessage::SwimAlive {
+                node_id,
+                incarnation,
+            } => {
                 self.mark_alive(node_id, *incarnation);
                 responses.push(msg.clone());
             }
@@ -102,16 +103,31 @@ fn swim_five_nodes_discover_each_other() {
         };
 
         let responses = nodes[0].1.handle_message(&join_msg);
-        assert!(!responses.is_empty(), "bootstrap should respond to SwimJoin");
-        assert!(nodes[0].1.is_alive(&nodes[i].0), "bootstrap should see node {} as alive", i);
+        assert!(
+            !responses.is_empty(),
+            "bootstrap should respond to SwimJoin"
+        );
+        assert!(
+            nodes[0].1.is_alive(&nodes[i].0),
+            "bootstrap should see node {} as alive",
+            i
+        );
 
         for resp in &responses {
             nodes[i].1.handle_message(resp);
         }
-        assert!(nodes[i].1.is_alive(&bootstrap_id), "node {} should see bootstrap as alive", i);
+        assert!(
+            nodes[i].1.is_alive(&bootstrap_id),
+            "node {} should see bootstrap as alive",
+            i
+        );
     }
 
-    assert_eq!(nodes[0].1.alive_count(), 4, "bootstrap should have 4 alive members");
+    assert_eq!(
+        nodes[0].1.alive_count(),
+        4,
+        "bootstrap should have 4 alive members"
+    );
 
     // Gossip: propagate all members to all nodes.
     for i in 1..5 {
@@ -127,7 +143,12 @@ fn swim_five_nodes_discover_each_other() {
     }
 
     for (i, (_, swim)) in nodes.iter().enumerate() {
-        assert!(swim.alive_count() >= 3, "node {} has {} alive (expected >= 3)", i, swim.alive_count());
+        assert!(
+            swim.alive_count() >= 3,
+            "node {} has {} alive (expected >= 3)",
+            i,
+            swim.alive_count()
+        );
     }
 
     println!("[PASS] SWIM: 5 nodes discovered each other via gossip");
@@ -176,7 +197,10 @@ fn rlnc_distribute_across_nodes_and_decode() {
     let recovered = decoder.decode().expect("decode failed");
     assert_eq!(&recovered[..original_data.len()], original_data.as_slice());
 
-    println!("[PASS] RLNC: distributed across 3 nodes, decoded with {} pieces", pieces_collected);
+    println!(
+        "[PASS] RLNC: distributed across 3 nodes, decoded with {} pieces",
+        pieces_collected
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -236,30 +260,65 @@ fn wire_message_all_variants_round_trip() {
     let messages: Vec<WireMessage> = vec![
         WireMessage::Ping { nonce: 12345 },
         WireMessage::Pong { nonce: 12345 },
-        WireMessage::PieceRequest { cid, piece_indices: vec![0, 1, 2] },
+        WireMessage::PieceRequest {
+            cid,
+            piece_indices: vec![0, 1, 2],
+        },
         WireMessage::PieceResponse { pieces: vec![] },
         WireMessage::ProviderAnnounce { cid, node_id },
         WireMessage::SignedWrite {
-            payload: b"data".to_vec(), signature: sig, writer: node_id, cas_version: 42,
+            payload: b"data".to_vec(),
+            signature: sig,
+            writer: node_id,
+            cas_version: 42,
         },
-        WireMessage::SwimJoin { node_id, listen_port: 9000 },
-        WireMessage::SwimAlive { node_id, incarnation: 7 },
-        WireMessage::SwimSuspect { node_id: peer_id, incarnation: 3, from: node_id },
-        WireMessage::SwimDead { node_id: peer_id, incarnation: 5, from: node_id },
-        WireMessage::HealthReport { cid, available_pieces: 60, target_pieces: 80 },
+        WireMessage::SwimJoin {
+            node_id,
+            listen_port: 9000,
+        },
+        WireMessage::SwimAlive {
+            node_id,
+            incarnation: 7,
+        },
+        WireMessage::SwimSuspect {
+            node_id: peer_id,
+            incarnation: 3,
+            from: node_id,
+        },
+        WireMessage::SwimDead {
+            node_id: peer_id,
+            incarnation: 5,
+            from: node_id,
+        },
+        WireMessage::HealthReport {
+            cid,
+            available_pieces: 60,
+            target_pieces: 80,
+        },
         WireMessage::SwimPing {
             from: node_id,
-            piggyback: vec![WireMessage::SwimAlive { node_id: peer_id, incarnation: 1 }],
+            piggyback: vec![WireMessage::SwimAlive {
+                node_id: peer_id,
+                incarnation: 1,
+            }],
         },
     ];
 
     for (i, msg) in messages.iter().enumerate() {
         let bytes = wire::encode(msg).expect("encode failed");
         let decoded = wire::decode(&bytes).expect("decode failed");
-        assert_eq!(msg.type_name(), decoded.type_name(), "variant {} mismatch", i);
+        assert_eq!(
+            msg.type_name(),
+            decoded.type_name(),
+            "variant {} mismatch",
+            i
+        );
     }
 
-    println!("[PASS] Wire: all {} message variants round-trip correctly", messages.len());
+    println!(
+        "[PASS] Wire: all {} message variants round-trip correctly",
+        messages.len()
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -275,11 +334,17 @@ fn crypto_ed25519_cross_node_verification() {
     let sig = kp_a.sign(payload);
 
     // Node B verifies using A's public key.
-    assert!(identity::verify(payload, &sig, &kp_a.node_id()), "B should verify A's sig");
+    assert!(
+        identity::verify(payload, &sig, &kp_a.node_id()),
+        "B should verify A's sig"
+    );
 
     // Node B cannot forge as Node A.
     let forged = kp_b.sign(payload);
-    assert!(!identity::verify(payload, &forged, &kp_a.node_id()), "B's sig should NOT verify as A");
+    assert!(
+        !identity::verify(payload, &forged, &kp_a.node_id()),
+        "B's sig should NOT verify as A"
+    );
 
     println!("[PASS] Crypto: cross-node Ed25519 verification works");
 }
@@ -299,7 +364,10 @@ fn hommac_integrity_across_nodes() {
 
     let mut tampered = data.clone();
     tampered[0] ^= 0xFF;
-    assert!(!hommac::verify_tag(&key, &cv, &tampered, &tag), "tampered should fail");
+    assert!(
+        !hommac::verify_tag(&key, &cv, &tampered, &tag),
+        "tampered should fail"
+    );
 
     println!("[PASS] HomMAC: cross-node integrity verification works");
 }
@@ -328,7 +396,9 @@ fn content_store_and_retrieve_by_cid() {
         let mut decoder = RlncDecoder::new(4, pieces[0].data.len());
         for piece in pieces {
             let _ = decoder.add_piece(piece);
-            if decoder.is_decodable() { break; }
+            if decoder.is_decodable() {
+                break;
+            }
         }
         let recovered = decoder.decode().expect("decode");
         assert_eq!(&recovered[..data.len()], data);
@@ -355,7 +425,9 @@ fn full_pipeline_encode_sign_transmit_verify_decode() {
     let sig = kp_a.sign(manifest.as_bytes());
 
     // Serialize to wire
-    let response = WireMessage::PieceResponse { pieces: pieces.clone() };
+    let response = WireMessage::PieceResponse {
+        pieces: pieces.clone(),
+    };
     let wire_bytes = wire::encode(&response).expect("encode");
 
     // Node B: deserialize + verify
@@ -369,13 +441,18 @@ fn full_pipeline_encode_sign_transmit_verify_decode() {
         assert!(piece.verify_piece_id(), "piece failed verification");
     }
 
-    assert!(identity::verify(manifest.as_bytes(), &sig, &kp_a.node_id()), "sig should verify");
+    assert!(
+        identity::verify(manifest.as_bytes(), &sig, &kp_a.node_id()),
+        "sig should verify"
+    );
 
     // Node C: decode
     let mut decoder = RlncDecoder::new(k, encoder.piece_size());
     for piece in &stored_pieces {
         let _ = decoder.add_piece(piece);
-        if decoder.is_decodable() { break; }
+        if decoder.is_decodable() {
+            break;
+        }
     }
 
     let recovered = decoder.decode().expect("decode");
@@ -411,9 +488,13 @@ fn rlnc_large_data_k32_standard_generation() {
     for &node in &order {
         for piece in &stores[node] {
             let _ = decoder.add_piece(piece);
-            if decoder.is_decodable() { break; }
+            if decoder.is_decodable() {
+                break;
+            }
         }
-        if decoder.is_decodable() { break; }
+        if decoder.is_decodable() {
+            break;
+        }
     }
 
     assert!(decoder.is_decodable());
@@ -455,7 +536,9 @@ fn multiple_cids_independent_decode() {
         for piece in pieces {
             assert_eq!(&piece.cid, cid, "piece CID should match");
             let _ = decoder.add_piece(piece);
-            if decoder.is_decodable() { break; }
+            if decoder.is_decodable() {
+                break;
+            }
         }
         let recovered = decoder.decode().expect("decode");
         assert_eq!(recovered.len(), k as usize * piece_size);

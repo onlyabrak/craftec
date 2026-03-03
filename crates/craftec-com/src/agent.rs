@@ -142,10 +142,19 @@ mod tests {
     #[test]
     fn built_in_constructors_produce_correct_kind() {
         assert_eq!(Agent::local_eviction(cid(0)).kind, AgentKind::LocalEviction);
-        assert_eq!(Agent::reputation_scoring(cid(1)).kind, AgentKind::ReputationScoring);
+        assert_eq!(
+            Agent::reputation_scoring(cid(1)).kind,
+            AgentKind::ReputationScoring
+        );
         assert_eq!(Agent::load_balancing(cid(2)).kind, AgentKind::LoadBalancing);
-        assert_eq!(Agent::degradation_policy(cid(3)).kind, AgentKind::DegradationPolicy);
-        assert_eq!(Agent::schema_migration(cid(4)).kind, AgentKind::SchemaMigration);
+        assert_eq!(
+            Agent::degradation_policy(cid(3)).kind,
+            AgentKind::DegradationPolicy
+        );
+        assert_eq!(
+            Agent::schema_migration(cid(4)).kind,
+            AgentKind::SchemaMigration
+        );
     }
 
     #[test]
