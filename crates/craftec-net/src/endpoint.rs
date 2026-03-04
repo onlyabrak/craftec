@@ -535,63 +535,13 @@ impl CraftecEndpoint {
                             let _ = hlc.observe(hlc_ts);
                         }
                         if msg.is_swim() {
-                            match &msg {
-                                WireMessage::SwimPingAck { from, nonce, incarnation } => {
-                                    // Direct ack — resolve pending probe.
-                                    swim.resolve_probe(*nonce, *incarnation);
-                                    swim.mark_alive(from, *incarnation);
-                                }
-                                WireMessage::SwimPing { from, nonce, piggyback } => {
-                                    // Respond with PingAck only (no gossip relay to avoid amplification).
-                                    swim.mark_alive(from, 0);
-                                    for piggybacked_msg in piggyback {
-                                        // Apply state changes but don't propagate.
-                                        let _ = swim.handle_message(piggybacked_msg);
-                                    }
-                                    let own_inc = swim.current_incarnation();
-                                    let ack = WireMessage::SwimPingAck {
-                                        from: *swim.node_id(),
-                                        nonce: *nonce,
-                                        incarnation: own_inc,
-                                    };
-                                    if let Ok(ack_bytes) = craftec_types::wire::encode_framed(&ack) {
-                                        match conn.open_uni().await {
-                                            Ok(mut send_stream) => {
-                                                let _ = send_stream.write_all(&ack_bytes).await;
-                                                let _ = send_stream.finish();
-                                            }
-                                            Err(_) => break,
-                                        }
+                            match handle_swim_msg(&msg, &swim) {
+                                SwimReply::Send(reply) => {
+                                    if !send_swim_reply(&conn, reply, &remote).await {
+                                        break;
                                     }
                                 }
-                                WireMessage::SwimAlive { node_id, incarnation } => {
-                                    // Apply state change only — no response (prevents amplification).
-                                    swim.mark_alive(node_id, *incarnation);
-                                }
-                                WireMessage::SwimSuspect { node_id, incarnation, .. } => {
-                                    swim.mark_suspect(node_id, *incarnation);
-                                }
-                                WireMessage::SwimDead { node_id, incarnation, .. } => {
-                                    swim.mark_dead(node_id, *incarnation);
-                                }
-                                WireMessage::SwimJoin { node_id, .. } => {
-                                    swim.mark_alive(node_id, 0);
-                                    // Reply with SwimAlive so the joining node learns about us.
-                                    let alive = WireMessage::SwimAlive {
-                                        node_id: *swim.node_id(),
-                                        incarnation: swim.current_incarnation(),
-                                    };
-                                    if let Ok(alive_bytes) = craftec_types::wire::encode_framed(&alive) {
-                                        match conn.open_uni().await {
-                                            Ok(mut send_stream) => {
-                                                let _ = send_stream.write_all(&alive_bytes).await;
-                                                let _ = send_stream.finish();
-                                            }
-                                            Err(_) => break,
-                                        }
-                                    }
-                                }
-                                _ => {}
+                                SwimReply::None => {}
                             }
                         } else {
                             tracing::debug!(
@@ -662,81 +612,13 @@ impl CraftecEndpoint {
 
                             // Route SWIM messages to the membership handler.
                             if msg.is_swim() {
-                                // Intercept PingAck before normal processing
-                                // (resolves pending probes — same as handle_swim_conn).
-                                if let WireMessage::SwimPingAck {
-                                    from,
-                                    nonce,
-                                    incarnation,
-                                } = &msg
-                                {
-                                    tracing::debug!(
-                                        peer = %from,
-                                        nonce,
-                                        incarnation,
-                                        "CraftecEndpoint: SWIM PingAck received (craftec ALPN)"
-                                    );
-                                    swim.resolve_probe(*nonce, *incarnation);
-                                    swim.mark_alive(from, *incarnation);
-                                    continue;
-                                }
-
-                                // Handle each SWIM message type explicitly to prevent
-                                // amplification loops (only send PingAck for Ping, no gossip relay).
-                                match &msg {
-                                    WireMessage::SwimPing { from, nonce, piggyback } => {
-                                        swim.mark_alive(from, 0);
-                                        for piggybacked_msg in piggyback {
-                                            let _ = swim.handle_message(piggybacked_msg);
-                                        }
-                                        let ack = WireMessage::SwimPingAck {
-                                            from: *swim.node_id(),
-                                            nonce: *nonce,
-                                            incarnation: swim.current_incarnation(),
-                                        };
-                                        if let Ok(ack_bytes) = craftec_types::wire::encode_framed(&ack) {
-                                            match conn.open_uni().await {
-                                                Ok(mut send_stream) => {
-                                                    let _ = send_stream.write_all(&ack_bytes).await;
-                                                    let _ = send_stream.finish();
-                                                }
-                                                Err(e) => {
-                                                    tracing::debug!(peer = %remote, error = %e, "CraftecEndpoint: SWIM PingAck send failed");
-                                                    break;
-                                                }
-                                            }
+                                match handle_swim_msg(&msg, &swim) {
+                                    SwimReply::Send(reply) => {
+                                        if !send_swim_reply(&conn, reply, &remote).await {
+                                            break;
                                         }
                                     }
-                                    WireMessage::SwimAlive { node_id, incarnation } => {
-                                        swim.mark_alive(node_id, *incarnation);
-                                    }
-                                    WireMessage::SwimSuspect { node_id, incarnation, .. } => {
-                                        swim.mark_suspect(node_id, *incarnation);
-                                    }
-                                    WireMessage::SwimDead { node_id, incarnation, .. } => {
-                                        swim.mark_dead(node_id, *incarnation);
-                                    }
-                                    WireMessage::SwimJoin { node_id, .. } => {
-                                        swim.mark_alive(node_id, 0);
-                                        // Reply with SwimAlive so the joining node learns about us.
-                                        let alive = WireMessage::SwimAlive {
-                                            node_id: *swim.node_id(),
-                                            incarnation: swim.current_incarnation(),
-                                        };
-                                        if let Ok(alive_bytes) = craftec_types::wire::encode_framed(&alive) {
-                                            match conn.open_uni().await {
-                                                Ok(mut send_stream) => {
-                                                    let _ = send_stream.write_all(&alive_bytes).await;
-                                                    let _ = send_stream.finish();
-                                                }
-                                                Err(e) => {
-                                                    tracing::debug!(peer = %remote, error = %e, "CraftecEndpoint: SwimAlive reply send failed");
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    _ => {}
+                                    SwimReply::None => {}
                                 }
                                 continue;
                             }
@@ -784,6 +666,9 @@ impl CraftecEndpoint {
         }
     }
 
+    /// Maximum concurrent RPC streams per connection (prevents resource exhaustion).
+    const MAX_CONCURRENT_RPC_STREAMS: usize = 16;
+
     /// Handle an incoming RPC connection using bidi streams for request-response.
     async fn handle_rpc_conn(
         conn: iroh::endpoint::Connection,
@@ -791,6 +676,7 @@ impl CraftecEndpoint {
         handler: Arc<dyn RpcHandler>,
         hlc: Arc<HybridClock>,
     ) {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(Self::MAX_CONCURRENT_RPC_STREAMS));
         loop {
             let (send, mut recv) = match conn.accept_bi().await {
                 Ok(s) => s,
@@ -799,9 +685,17 @@ impl CraftecEndpoint {
                     break;
                 }
             };
+            let permit = match semaphore.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::warn!(peer = %remote, "CraftecEndpoint: RPC stream limit reached ({} concurrent)", Self::MAX_CONCURRENT_RPC_STREAMS);
+                    continue;
+                }
+            };
             let handler = handler.clone();
             let hlc = hlc.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 let result: std::result::Result<(), anyhow::Error> = async {
                     let bytes = tokio::time::timeout(
                         STREAM_READ_TIMEOUT,
@@ -861,81 +755,14 @@ impl CraftecEndpoint {
                             );
                             continue;
                         }
-                        // T2: intercept SwimPingAck to resolve pending probes
-                        // before normal handle_message processing.
-                        if let WireMessage::SwimPingAck {
-                            from,
-                            nonce,
-                            incarnation,
-                        } = &msg
-                        {
-                            tracing::debug!(
-                                peer = %from,
-                                nonce,
-                                incarnation,
-                                "CraftecEndpoint: SWIM PingAck received"
-                            );
-                            swim.resolve_probe(*nonce, *incarnation);
-                            swim.mark_alive(from, *incarnation);
-                            continue;
-                        }
-
-                        // Handle each SWIM message type explicitly to prevent
-                        // amplification loops (only send PingAck for Ping, no gossip relay).
-                        match &msg {
-                            WireMessage::SwimPing { from, nonce, piggyback } => {
-                                swim.mark_alive(from, 0);
-                                for piggybacked_msg in piggyback {
-                                    let _ = swim.handle_message(piggybacked_msg);
-                                }
-                                let ack = WireMessage::SwimPingAck {
-                                    from: *swim.node_id(),
-                                    nonce: *nonce,
-                                    incarnation: swim.current_incarnation(),
-                                };
-                                if let Ok(ack_bytes) = craftec_types::wire::encode_framed(&ack) {
-                                    match conn.open_uni().await {
-                                        Ok(mut send_stream) => {
-                                            let _ = send_stream.write_all(&ack_bytes).await;
-                                            let _ = send_stream.finish();
-                                        }
-                                        Err(e) => {
-                                            tracing::debug!(peer = %remote, error = %e, "CraftecEndpoint: SWIM PingAck send failed");
-                                            break;
-                                        }
-                                    }
+                        // Handle SWIM message without amplification.
+                        match handle_swim_msg(&msg, &swim) {
+                            SwimReply::Send(reply) => {
+                                if !send_swim_reply(&conn, reply, &remote).await {
+                                    break;
                                 }
                             }
-                            WireMessage::SwimAlive { node_id, incarnation } => {
-                                swim.mark_alive(node_id, *incarnation);
-                            }
-                            WireMessage::SwimSuspect { node_id, incarnation, .. } => {
-                                swim.mark_suspect(node_id, *incarnation);
-                            }
-                            WireMessage::SwimDead { node_id, incarnation, .. } => {
-                                swim.mark_dead(node_id, *incarnation);
-                            }
-                            WireMessage::SwimJoin { node_id, .. } => {
-                                swim.mark_alive(node_id, 0);
-                                // Reply with SwimAlive so the joining node learns about us.
-                                let alive = WireMessage::SwimAlive {
-                                    node_id: *swim.node_id(),
-                                    incarnation: swim.current_incarnation(),
-                                };
-                                if let Ok(alive_bytes) = craftec_types::wire::encode_framed(&alive) {
-                                    match conn.open_uni().await {
-                                        Ok(mut send_stream) => {
-                                            let _ = send_stream.write_all(&alive_bytes).await;
-                                            let _ = send_stream.finish();
-                                        }
-                                        Err(e) => {
-                                            tracing::debug!(peer = %remote, error = %e, "CraftecEndpoint: SwimAlive reply send failed");
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            _ => {}
+                            SwimReply::None => {}
                         }
                     }
                     Err(e) => {
@@ -959,16 +786,118 @@ impl CraftecEndpoint {
     }
 }
 
+// ── Shared SWIM handler (no amplification) ────────────────────────────────
+
+/// Possible reply to send after handling a SWIM message.
+enum SwimReply {
+    /// No reply needed (state-only messages).
+    None,
+    /// Send this message back to the peer.
+    Send(WireMessage),
+}
+
+/// Handle a single SWIM message without amplification.
+///
+/// - `SwimPingAck` resolves pending probes and marks alive.
+/// - `SwimPing` marks alive, applies piggybacked state, returns a `PingAck`.
+/// - `SwimAlive/SwimSuspect/SwimDead` apply state only — no response.
+/// - `SwimJoin` marks alive and returns a `SwimAlive` so the joiner learns about us.
+///
+/// Returns `SwimReply::Send(msg)` if a reply should be sent, `SwimReply::None` otherwise.
+fn handle_swim_msg(msg: &WireMessage, swim: &SwimMembership) -> SwimReply {
+    match msg {
+        WireMessage::SwimPingAck {
+            from,
+            nonce,
+            incarnation,
+        } => {
+            swim.resolve_probe(*nonce, *incarnation);
+            swim.mark_alive(from, *incarnation);
+            SwimReply::None
+        }
+        WireMessage::SwimPing {
+            from,
+            nonce,
+            piggyback,
+        } => {
+            swim.mark_alive(from, 0);
+            for piggybacked_msg in piggyback {
+                let _ = swim.handle_message(piggybacked_msg);
+            }
+            SwimReply::Send(WireMessage::SwimPingAck {
+                from: *swim.node_id(),
+                nonce: *nonce,
+                incarnation: swim.current_incarnation(),
+            })
+        }
+        WireMessage::SwimAlive {
+            node_id,
+            incarnation,
+        } => {
+            swim.mark_alive(node_id, *incarnation);
+            SwimReply::None
+        }
+        WireMessage::SwimSuspect {
+            node_id,
+            incarnation,
+            ..
+        } => {
+            swim.mark_suspect(node_id, *incarnation);
+            SwimReply::None
+        }
+        WireMessage::SwimDead {
+            node_id,
+            incarnation,
+            ..
+        } => {
+            swim.mark_dead(node_id, *incarnation);
+            SwimReply::None
+        }
+        WireMessage::SwimJoin { node_id, .. } => {
+            swim.mark_alive(node_id, 0);
+            SwimReply::Send(WireMessage::SwimAlive {
+                node_id: *swim.node_id(),
+                incarnation: swim.current_incarnation(),
+            })
+        }
+        _ => SwimReply::None,
+    }
+}
+
+/// Send a SWIM reply over a uni-stream on the given connection.
+///
+/// Returns `false` if the connection is broken and the caller should break the loop.
+async fn send_swim_reply(
+    conn: &iroh::endpoint::Connection,
+    reply: WireMessage,
+    remote: &NodeId,
+) -> bool {
+    match craftec_types::wire::encode_framed(&reply) {
+        Ok(bytes) => match conn.open_uni().await {
+            Ok(mut send_stream) => {
+                let _ = send_stream.write_all(&bytes).await;
+                let _ = send_stream.finish();
+                true
+            }
+            Err(e) => {
+                tracing::debug!(peer = %remote, error = %e, "CraftecEndpoint: SWIM reply send failed");
+                false
+            }
+        },
+        Err(_) => true,
+    }
+}
+
 // ── RPC client helpers ──────────────────────────────────────────────────────
 
 /// Create an ephemeral iroh endpoint suitable for outbound-only RPC connections.
 ///
 /// Uses a random secret key and no ALPNs (outbound connections specify ALPN at connect time).
 pub async fn create_rpc_client_endpoint() -> std::result::Result<iroh::Endpoint, anyhow::Error> {
-    // Generate a random 32-byte key and construct via from_bytes to avoid
-    // rand_core version conflicts between iroh and the local crate.
+    // Generate key via OsRng + from_bytes to avoid rand version conflicts
+    // (iroh uses rand 0.9, workspace uses rand 0.8).
     let mut key_bytes = [0u8; 32];
-    rand::Rng::fill(&mut rand::thread_rng(), &mut key_bytes);
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key_bytes);
     let secret_key = iroh::SecretKey::from_bytes(&key_bytes);
     let endpoint = iroh::Endpoint::builder()
         .secret_key(secret_key)

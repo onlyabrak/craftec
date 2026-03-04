@@ -87,8 +87,24 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Overall timeout for a CLI RPC request (connect + send + receive).
+const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Send an RPC request and receive the response.
+///
+/// The entire RPC flow (connect, send, receive) is bounded by a 10-second timeout.
+/// Response payloads are limited to 4 MiB.
 async fn send_rpc(
+    node_id_bytes: &[u8; 32],
+    addr: SocketAddr,
+    request: RpcRequest,
+) -> Result<RpcResponse> {
+    tokio::time::timeout(RPC_TIMEOUT, send_rpc_inner(node_id_bytes, addr, request))
+        .await
+        .map_err(|_| anyhow::anyhow!("RPC request timed out after {}s", RPC_TIMEOUT.as_secs()))?
+}
+
+async fn send_rpc_inner(
     node_id_bytes: &[u8; 32],
     addr: SocketAddr,
     request: RpcRequest,
@@ -216,9 +232,20 @@ fn print_response(resp: RpcResponse, cmd: &str) {
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn data_dir() -> Result<PathBuf> {
-    Ok(PathBuf::from(
-        std::env::var("CRAFTEC_DATA_DIR").unwrap_or_else(|_| "/data".into()),
-    ))
+    // 1. Explicit env var (Docker sets this).
+    if let Ok(dir) = std::env::var("CRAFTEC_DATA_DIR") {
+        return Ok(PathBuf::from(dir));
+    }
+    // 2. Read from craftec.json in the current directory (matches main.rs config loading).
+    if let Ok(contents) = std::fs::read_to_string("craftec.json") {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
+            if let Some(dir) = json.get("data_dir").and_then(|v| v.as_str()) {
+                return Ok(PathBuf::from(dir));
+            }
+        }
+    }
+    // 3. Default to ./data for local dev.
+    Ok(PathBuf::from("./data"))
 }
 
 fn listen_port() -> u16 {
