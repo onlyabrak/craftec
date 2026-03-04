@@ -14,6 +14,91 @@ use crate::error::{CraftecError, Result};
 use crate::identity::{NodeId, Signature};
 use crate::piece::CodedPiece;
 
+// ── RPC type tags ───────────────────────────────────────────────────────────
+
+/// Type tag for RPC request frames.
+pub const TYPE_TAG_RPC_REQUEST: u32 = 0x0200;
+/// Type tag for RPC response frames.
+pub const TYPE_TAG_RPC_RESPONSE: u32 = 0x0201;
+
+// ── RPC enums ───────────────────────────────────────────────────────────────
+
+/// A client-to-node RPC request multiplexed over the `/craftec/rpc/1` ALPN.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RpcRequest {
+    Status,
+    StorePut {
+        data: Vec<u8>,
+    },
+    StoreGet {
+        cid: Cid,
+    },
+    StoreList,
+    SqlQuery {
+        sql: String,
+    },
+    SqlExecute {
+        sql: String,
+        writer: NodeId,
+        signature: Signature,
+    },
+    Peers,
+    PieceInfo {
+        cid: Cid,
+    },
+}
+
+/// A node-to-client RPC response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RpcResponse {
+    Status {
+        node_id: NodeId,
+        alive_peers: usize,
+        store_objects: usize,
+        db_root_cid: Cid,
+        uptime_secs: u64,
+    },
+    StorePut {
+        cid: Cid,
+    },
+    StoreGet {
+        data: Option<Vec<u8>>,
+    },
+    StoreList {
+        cids: Vec<Cid>,
+    },
+    SqlQuery {
+        rows: Vec<Vec<RpcValue>>,
+    },
+    SqlExecute {
+        root_cid: Cid,
+    },
+    Peers {
+        peers: Vec<NodeId>,
+        count: usize,
+    },
+    PieceInfo {
+        cid: Cid,
+        available: u32,
+        k: Option<u32>,
+        holders: Vec<NodeId>,
+    },
+    Error {
+        code: u32,
+        message: String,
+    },
+}
+
+/// A single SQL column value, used in RPC query results.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RpcValue {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
 /// Every message sent or received over the Craftec wire protocol.
 ///
 /// Variants cover liveness checks, piece exchange, SWIM gossip, mutable-data
@@ -155,6 +240,19 @@ pub const FRAME_HEADER_V0_SIZE: usize = 9;
 
 impl WireMessage {
     /// Return a human-readable name for the message variant (for logging).
+    /// Returns `true` if this message is a SWIM membership protocol variant.
+    pub fn is_swim(&self) -> bool {
+        matches!(
+            self,
+            Self::SwimJoin { .. }
+                | Self::SwimAlive { .. }
+                | Self::SwimSuspect { .. }
+                | Self::SwimDead { .. }
+                | Self::SwimPing { .. }
+                | Self::SwimPingAck { .. }
+        )
+    }
+
     pub fn type_name(&self) -> &'static str {
         match self {
             Self::Ping { .. } => "Ping",
@@ -313,6 +411,116 @@ pub fn decode_framed_with_hlc(data: &[u8]) -> Result<(WireMessage, u64)> {
             version
         ))),
     }
+}
+
+// ── RPC encode/decode ───────────────────────────────────────────────────────
+
+/// Encode an [`RpcRequest`] with the v1 frame header.
+///
+/// Frame layout: `[type_tag:4 BE | version:1 | hlc_ts:8 BE | payload_len:4 BE | postcard payload]`
+pub fn encode_rpc_request(req: &RpcRequest, hlc_ts: u64) -> Result<Vec<u8>> {
+    let payload = postcard::to_allocvec(req)
+        .map_err(|e| CraftecError::SerializationError(format!("postcard encode error: {e}")))?;
+    let mut frame = Vec::with_capacity(FRAME_HEADER_SIZE + payload.len());
+    frame.extend_from_slice(&TYPE_TAG_RPC_REQUEST.to_be_bytes());
+    frame.push(WIRE_VERSION);
+    frame.extend_from_slice(&hlc_ts.to_be_bytes());
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&payload);
+    Ok(frame)
+}
+
+/// Encode an [`RpcResponse`] with the v1 frame header.
+pub fn encode_rpc_response(resp: &RpcResponse, hlc_ts: u64) -> Result<Vec<u8>> {
+    let payload = postcard::to_allocvec(resp)
+        .map_err(|e| CraftecError::SerializationError(format!("postcard encode error: {e}")))?;
+    let mut frame = Vec::with_capacity(FRAME_HEADER_SIZE + payload.len());
+    frame.extend_from_slice(&TYPE_TAG_RPC_RESPONSE.to_be_bytes());
+    frame.push(WIRE_VERSION);
+    frame.extend_from_slice(&hlc_ts.to_be_bytes());
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&payload);
+    Ok(frame)
+}
+
+/// Decode a framed [`RpcRequest`], returning `(request, hlc_timestamp)`.
+pub fn decode_rpc_request(data: &[u8]) -> Result<(RpcRequest, u64)> {
+    if data.len() < FRAME_HEADER_SIZE {
+        return Err(CraftecError::SerializationError(format!(
+            "RPC request frame too short: {} bytes (need at least {})",
+            data.len(),
+            FRAME_HEADER_SIZE
+        )));
+    }
+    let type_tag = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+    if type_tag != TYPE_TAG_RPC_REQUEST {
+        return Err(CraftecError::SerializationError(format!(
+            "expected RPC request type tag 0x{:04x}, got 0x{:04x}",
+            TYPE_TAG_RPC_REQUEST, type_tag
+        )));
+    }
+    let version = data[4];
+    if version != WIRE_VERSION {
+        return Err(CraftecError::SerializationError(format!(
+            "unsupported wire version: {} (expected {})",
+            version, WIRE_VERSION
+        )));
+    }
+    let hlc_ts = u64::from_be_bytes([
+        data[5], data[6], data[7], data[8], data[9], data[10], data[11], data[12],
+    ]);
+    let payload_len = u32::from_be_bytes([data[13], data[14], data[15], data[16]]) as usize;
+    if data.len() < FRAME_HEADER_SIZE + payload_len {
+        return Err(CraftecError::SerializationError(format!(
+            "RPC request frame truncated: have {} bytes, need {}",
+            data.len(),
+            FRAME_HEADER_SIZE + payload_len
+        )));
+    }
+    let req: RpcRequest =
+        postcard::from_bytes(&data[FRAME_HEADER_SIZE..FRAME_HEADER_SIZE + payload_len])
+            .map_err(|e| CraftecError::SerializationError(format!("postcard decode error: {e}")))?;
+    Ok((req, hlc_ts))
+}
+
+/// Decode a framed [`RpcResponse`], returning `(response, hlc_timestamp)`.
+pub fn decode_rpc_response(data: &[u8]) -> Result<(RpcResponse, u64)> {
+    if data.len() < FRAME_HEADER_SIZE {
+        return Err(CraftecError::SerializationError(format!(
+            "RPC response frame too short: {} bytes (need at least {})",
+            data.len(),
+            FRAME_HEADER_SIZE
+        )));
+    }
+    let type_tag = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+    if type_tag != TYPE_TAG_RPC_RESPONSE {
+        return Err(CraftecError::SerializationError(format!(
+            "expected RPC response type tag 0x{:04x}, got 0x{:04x}",
+            TYPE_TAG_RPC_RESPONSE, type_tag
+        )));
+    }
+    let version = data[4];
+    if version != WIRE_VERSION {
+        return Err(CraftecError::SerializationError(format!(
+            "unsupported wire version: {} (expected {})",
+            version, WIRE_VERSION
+        )));
+    }
+    let hlc_ts = u64::from_be_bytes([
+        data[5], data[6], data[7], data[8], data[9], data[10], data[11], data[12],
+    ]);
+    let payload_len = u32::from_be_bytes([data[13], data[14], data[15], data[16]]) as usize;
+    if data.len() < FRAME_HEADER_SIZE + payload_len {
+        return Err(CraftecError::SerializationError(format!(
+            "RPC response frame truncated: have {} bytes, need {}",
+            data.len(),
+            FRAME_HEADER_SIZE + payload_len
+        )));
+    }
+    let resp: RpcResponse =
+        postcard::from_bytes(&data[FRAME_HEADER_SIZE..FRAME_HEADER_SIZE + payload_len])
+            .map_err(|e| CraftecError::SerializationError(format!("postcard decode error: {e}")))?;
+    Ok((resp, hlc_ts))
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────

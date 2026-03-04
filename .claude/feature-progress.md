@@ -263,4 +263,23 @@
 - [x] Fix missing busy_timeout on write_conn — added PRAGMA busy_timeout = 5000 (database.rs)
 - [x] Fix SWIM probe nonce mismatch — extract nonce from message instead of allocating new one (swim.rs)
 - [x] Fix indirect probe sending to target instead of delegates (swim.rs)
+
+---
+
+## QUIC-Native RPC via ALPN + Docker Lifecycle Tests
+
+- [x] Phase 1: RPC Wire Types — RpcRequest, RpcResponse, RpcValue enums + encode/decode in wire.rs
+- [x] Phase 2: ALPN + Accept Loop — ALPN_RPC registration, bidi stream handler, client helpers in endpoint.rs
+- [x] Phase 3: RPC Handler — NodeRpcHandler in rpc.rs (Status, StorePut/Get/List, SqlQuery/Execute, Peers, PieceInfo)
+- [x] Phase 4: CLI Client — cli.rs subcommands (status, store put/get/list, query, execute, peers, pieces)
+- [x] Phase 5: Node Wiring — node.id file, RPC handler construction, accept_loop integration
+- [x] Phase 6: Docker Lifecycle Tests — 10 new tests in run_all.sh Phase 8 (RPC status/store/SQL/peers/pieces)
+
+### RPC + Docker Notes
+- SWIM message amplification bug fixed in all 3 connection handlers (read_outbound_conn, handle_craftec_conn, handle_swim_conn)
+  - Replaced handle_message() + gossip relay with explicit message-type dispatch: Ping → PingAck only, state updates only for Alive/Suspect/Dead/Join
+- Fixed probe_with_ack to mark suspect directly on connection failure (skip broken indirect probe)
+- Fixed `log_count` bash function: grep -c returns exit 1 on no match, causing double "0" output
+- Increased departure_detection sleep from 15s to 40s for QUIC connection idle timeout (~30s)
+- All 46/46 Docker tests pass, all cargo tests pass, clippy clean
 - [x] Fix unwrap_or_default on postcard serialization — proper error handling with skip (node.rs)

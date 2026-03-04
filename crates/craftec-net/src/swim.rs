@@ -40,6 +40,7 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use tokio::sync::oneshot;
 
+use craftec_types::event::Event;
 use craftec_types::{NodeId, WireMessage};
 
 /// Default time before a `Suspect` node is declared `Dead` (spec §18: 5 seconds).
@@ -119,6 +120,8 @@ pub struct SwimMembership {
     pending_probes: DashMap<u64, oneshot::Sender<u64>>,
     /// Monotonic tick counter for periodic membership summaries (C3).
     tick_count: AtomicU64,
+    /// Optional event sender for publishing PeerConnected/PeerDisconnected events.
+    event_tx: std::sync::OnceLock<tokio::sync::broadcast::Sender<Event>>,
 }
 
 impl SwimMembership {
@@ -142,6 +145,7 @@ impl SwimMembership {
             probe_nonce: AtomicU64::new(0),
             pending_probes: DashMap::new(),
             tick_count: AtomicU64::new(0),
+            event_tx: std::sync::OnceLock::new(),
         }
     }
 
@@ -179,9 +183,21 @@ impl SwimMembership {
         )
     }
 
+    /// Return a reference to the local node's [`NodeId`].
+    pub fn node_id(&self) -> &NodeId {
+        &self.local_id
+    }
+
     /// Return the local node's current incarnation number.
     pub fn current_incarnation(&self) -> u64 {
         self.incarnation.load(Ordering::Acquire)
+    }
+
+    /// Set an event sender for publishing PeerConnected/PeerDisconnected events.
+    ///
+    /// Called once during node initialisation to wire the event bus into SWIM.
+    pub fn set_event_sender(&self, tx: tokio::sync::broadcast::Sender<Event>) {
+        let _ = self.event_tx.set(tx);
     }
 
     // ── State transitions ──────────────────────────────────────────────────
@@ -194,6 +210,7 @@ impl SwimMembership {
         if node_id == &self.local_id {
             return; // Never update own entry — local state is authoritative.
         }
+        let is_new = !self.members.contains_key(node_id);
         self.members
             .entry(*node_id)
             .and_modify(|state| {
@@ -205,7 +222,7 @@ impl SwimMembership {
                     MemberState::Dead { incarnation: inc } => incarnation <= *inc,
                 };
                 if !dominated {
-                    tracing::debug!(node = %node_id, incarnation, "SWIM: mark_alive (update)");
+                    tracing::trace!(node = %node_id, incarnation, "SWIM: mark_alive (update)");
                     *state = MemberState::Alive { incarnation };
                 }
             })
@@ -213,6 +230,10 @@ impl SwimMembership {
                 tracing::debug!(node = %node_id, incarnation, "SWIM: mark_alive (new)");
                 MemberState::Alive { incarnation }
             });
+        // Fire PeerConnected event when a brand-new member joins.
+        if is_new && let Some(tx) = self.event_tx.get() {
+            let _ = tx.send(Event::PeerConnected { node_id: *node_id });
+        }
     }
 
     /// Mark `node_id` as `Suspect`.
@@ -266,6 +287,11 @@ impl SwimMembership {
             tracing::warn!("SWIM: received Dead claim about self — ignoring");
             return;
         }
+        let was_connected = self
+            .members
+            .get(node_id)
+            .map(|e| matches!(e.value(), MemberState::Alive { .. } | MemberState::Suspect { .. }))
+            .unwrap_or(false);
         self.members
             .entry(*node_id)
             .and_modify(|state| {
@@ -282,6 +308,10 @@ impl SwimMembership {
                 tracing::info!(node = %node_id, incarnation, "SWIM: mark_dead (new)");
                 MemberState::Dead { incarnation }
             });
+        // Fire PeerDisconnected event when a previously-connected node is declared dead.
+        if was_connected && let Some(tx) = self.event_tx.get() {
+            let _ = tx.send(Event::PeerDisconnected { node_id: *node_id });
+        }
     }
 
     // ── Probe-ack support (T2) ────────────────────────────────────────────
@@ -372,7 +402,7 @@ impl SwimMembership {
                 node_id,
                 incarnation,
             } => {
-                tracing::debug!(
+                tracing::trace!(
                     from = %node_id,
                     incarnation,
                     "SWIM: processed SwimAlive"
@@ -386,7 +416,7 @@ impl SwimMembership {
                 incarnation,
                 ..
             } => {
-                tracing::debug!(
+                tracing::trace!(
                     from = %node_id,
                     incarnation,
                     "SWIM: processed SwimSuspect"
@@ -414,7 +444,7 @@ impl SwimMembership {
                 nonce,
                 piggyback,
             } => {
-                tracing::debug!(
+                tracing::trace!(
                     from = %from,
                     nonce,
                     piggyback_count = piggyback.len(),
@@ -439,7 +469,7 @@ impl SwimMembership {
                 nonce,
                 incarnation,
             } => {
-                tracing::debug!(
+                tracing::trace!(
                     from = %from,
                     nonce,
                     incarnation,
@@ -642,23 +672,27 @@ async fn probe_with_ack(
     };
     let (tx, rx) = oneshot::channel();
     swim.pending_probes.insert(nonce, tx);
-    tracing::debug!(target = %target, nonce, "SWIM: probe sent");
+    tracing::trace!(target = %target, nonce, "SWIM: probe sent");
 
     if let Err(e) = endpoint.send_message(&target, &msg).await {
         swim.pending_probes.remove(&nonce);
-        tracing::debug!(peer = %target, error = %e, "SWIM: failed to send probe");
+        tracing::debug!(peer = %target, error = %e, "SWIM: failed to send probe — marking suspect");
+        // Connection failure is a strong signal the peer is down.
+        // Skip indirect probing (currently broken — no PingReq relay) and suspect directly.
+        let inc = swim.last_known_incarnation(&target);
+        swim.mark_suspect(&target, inc);
         return;
-    }
-
-    // Step 2: Wait for direct ack (400ms).
-    match tokio::time::timeout(ACK_TIMEOUT, rx).await {
-        Ok(Ok(_incarnation)) => {
-            // Ack received — target is alive.
-            tracing::trace!(peer = %target, nonce, "SWIM: probe ack received");
-            return;
-        }
-        _ => {
-            tracing::debug!(peer = %target, nonce, "SWIM: direct probe timeout — trying indirect");
+    } else {
+        // Step 2: Wait for direct ack (400ms).
+        match tokio::time::timeout(ACK_TIMEOUT, rx).await {
+            Ok(Ok(_incarnation)) => {
+                // Ack received — target is alive.
+                tracing::trace!(peer = %target, nonce, "SWIM: probe ack received");
+                return;
+            }
+            _ => {
+                tracing::debug!(peer = %target, nonce, "SWIM: direct probe timeout — trying indirect");
+            }
         }
     }
 

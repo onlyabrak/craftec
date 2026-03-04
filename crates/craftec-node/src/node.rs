@@ -68,6 +68,7 @@ use crate::event_bus::EventBus;
 use crate::handler::NodeMessageHandler;
 use crate::pending::PendingFetches;
 use crate::piece_store::CodedPieceIndex;
+use crate::rpc::NodeRpcHandler;
 use crate::shutdown::wait_for_shutdown;
 
 /// LRU cache capacity for the CraftOBJ content-addressed store.
@@ -174,7 +175,7 @@ impl CraftecNode {
         let keystore = KeyStore::new(&config.data_dir).context("failed to initialise KeyStore")?;
         tracing::info!(
             node_id = %keystore.node_id(),
-            "KeyStore ready"
+            "Ed25519 identity ready (KeyStore loaded)"
         );
 
         // ── Step 4: Initialize CraftOBJ store ────────────────────────────────
@@ -183,7 +184,7 @@ impl CraftecNode {
             ContentAddressedStore::new(&config.data_dir.join("obj"), OBJ_CACHE_CAPACITY)
                 .context("failed to initialise ContentAddressedStore")?,
         );
-        tracing::info!("ContentAddressedStore ready");
+        tracing::info!("CraftOBJ store init complete (ContentAddressedStore ready)");
 
         // ── Step 5: Initialize RLNC engine ───────────────────────────────────
         tracing::info!("Step 5: initializing RLNC engine...");
@@ -260,9 +261,16 @@ impl CraftecNode {
             "CraftecEndpoint ready"
         );
 
+        // Write NodeId hex to data_dir/node.id for CLI discovery.
+        let node_id_path = config.data_dir.join("node.id");
+        std::fs::write(&node_id_path, endpoint.node_id().to_string())
+            .with_context(|| format!("failed to write node.id at {}", node_id_path.display()))?;
+        tracing::info!(path = %node_id_path.display(), "node.id written for CLI discovery");
+
         // ── Step 10: Initialize SWIM membership + DHT ─────────────────────────
         tracing::info!("Step 10: initializing SWIM membership and DHT providers...");
         let swim = endpoint.swim().clone();
+        swim.set_event_sender(event_bus.sender());
         let dht = Arc::new(DhtProviders::new());
         let pending_fetches = Arc::new(PendingFetches::new());
         tracing::info!(
@@ -443,10 +451,17 @@ impl CraftecNode {
                 Arc::clone(&self.piece_index),
                 *self.endpoint.node_id(),
             ));
+            let rpc_handler: Arc<dyn craftec_net::RpcHandler> = Arc::new(NodeRpcHandler::new(
+                *self.endpoint.node_id(),
+                Arc::clone(&self.store),
+                Arc::clone(&self.database),
+                Arc::clone(&self.swim),
+                Arc::clone(&self.piece_tracker),
+            ));
             tasks.spawn(async move {
                 tracing::info!("Accept loop: starting...");
                 tokio::select! {
-                    _ = endpoint.accept_loop(handler) => {
+                    _ = endpoint.accept_loop(handler, Some(rpc_handler)) => {
                         tracing::info!("Accept loop: endpoint closed");
                     }
                     _ = shutdown_rx.recv() => {

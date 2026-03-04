@@ -29,15 +29,26 @@
 use anyhow::Result;
 use tracing_subscriber::{EnvFilter, fmt};
 
+mod cli;
 mod event_bus;
 mod handler;
 mod node;
 mod pending;
 mod piece_store;
+mod rpc;
 mod shutdown;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Check if this is a CLI subcommand invocation (not a node start).
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.is_empty() {
+        // CLI mode — no tracing init (keep stdout clean for machine parsing).
+        return cli::run_cli(&args).await;
+    }
+
+    // ── Node mode (original behavior) ──────────────────────────────────────
+
     // 1. Initialize tracing
     init_tracing();
     tracing::info!("Craftec node starting...");
@@ -106,6 +117,12 @@ fn apply_env_overrides(
             .collect();
         tracing::info!(count = peers.len(), "Env override: CRAFTEC_BOOTSTRAP_PEERS");
         config.bootstrap_peers = peers;
+    }
+    if let Ok(val) = std::env::var("CRAFTEC_HEALTH_SCAN_INTERVAL_SECS")
+        && let Ok(secs) = val.parse::<u64>()
+    {
+        tracing::info!(secs, "Env override: CRAFTEC_HEALTH_SCAN_INTERVAL_SECS");
+        config.health_scan_interval_secs = secs;
     }
     config
 }

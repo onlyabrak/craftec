@@ -30,9 +30,11 @@ pub mod pending;
 pub mod pool;
 pub mod swim;
 
-pub use connection::ConnectionHandler;
+pub use connection::{ConnectionHandler, RpcHandler};
 pub use dht::{DhtProviders, announce_cid_to_peers};
-pub use endpoint::{ALPN_CRAFTEC, ALPN_SWIM, CraftecEndpoint};
+pub use endpoint::{
+    ALPN_CRAFTEC, ALPN_RPC, ALPN_SWIM, CraftecEndpoint, create_rpc_client_endpoint, rpc_connect,
+};
 pub use error::NetError;
 pub use pending::PendingFetches;
 pub use pool::ConnectionPool;

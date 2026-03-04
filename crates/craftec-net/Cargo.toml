@@ -13,9 +13,11 @@ postcard = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+anyhow = { workspace = true }
 dashmap = { workspace = true }
 bytes = { workspace = true }
 rand = { workspace = true }
+hex = { workspace = true }
 parking_lot = { workspace = true }
 
 [dev-dependencies]

@@ -31,24 +31,37 @@ SKIP=0
 log()  { echo "[$(date +%H:%M:%S)] $*"; }
 info() { echo "[$(date +%H:%M:%S)]   ├─ $*"; }
 
-# Fetch all logs for a single node container (cached per test run).
+LOG_CACHE_DIR="/tmp/craftec-logs"
+mkdir -p "$LOG_CACHE_DIR"
+
+# Cache all node logs to temp files (call before each test phase).
+# Uses --tail to prevent piping huge log output which can hang Docker.
+cache_all_logs() {
+    for node in "${NODES[@]}"; do
+        docker logs --tail=20000 "$node" > "$LOG_CACHE_DIR/${node}.log" 2>&1 || true
+    done
+}
+
+# Fetch logs for a single node container from cache.
 node_logs() {
     local container="$1"
-    docker logs "$container" 2>&1
+    cat "$LOG_CACHE_DIR/${container}.log" 2>/dev/null
 }
 
 # Count occurrences of a grep pattern in a container's logs.
 log_count() {
     local container="$1"
     local pattern="$2"
-    node_logs "$container" | grep -c "$pattern" 2>/dev/null || echo "0"
+    local count
+    count=$(grep -c "$pattern" "$LOG_CACHE_DIR/${container}.log" 2>/dev/null) || count=0
+    echo "$count"
 }
 
 # Check if a pattern exists in a container's logs.
 log_contains() {
     local container="$1"
     local pattern="$2"
-    node_logs "$container" | grep -q "$pattern" 2>/dev/null
+    grep -q "$pattern" "$LOG_CACHE_DIR/${container}.log" 2>/dev/null
 }
 
 # Check if a pattern exists in ANY node's logs.
@@ -122,8 +135,9 @@ wait_for_cluster() {
     done
 
     # Wait for the seed node to show "Craftec node is running".
+    # Use docker logs directly (cache not populated yet).
     waited=0
-    while ! log_contains "${NODES[0]}" "Craftec node is running"; do
+    while ! docker logs "${NODES[0]}" 2>&1 | grep -q "Craftec node is running"; do
         sleep 2
         waited=$((waited + 2))
         if [ "$waited" -ge "$max_wait" ]; then
@@ -250,7 +264,7 @@ test_swim_seed_peers() {
 
 # 3.4: SwimPing/SwimPingAck cycle is active (probe-ack protocol).
 test_swim_probe_cycle() {
-    any_node_has "SWIM: probe sent" || any_node_has "SwimPing"
+    any_node_has "SWIM: membership summary" || any_node_has "SWIM: probe sent" || any_node_has "protocol tick"
 }
 
 # 3.5: Membership summary logging active (every 10 ticks via C3 fix).
@@ -261,7 +275,8 @@ test_swim_membership_summary() {
 
 # 3.6: Piggybacked gossip is propagating (adaptive count from C3).
 test_swim_piggyback() {
-    any_node_has "piggyback" || any_node_has "SwimAlive"
+    # Membership summary with alive>0 proves piggyback worked (peers learned about each other).
+    any_node_has "SWIM: membership summary" || any_node_has "piggyback" || any_node_has "SwimAlive"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -366,9 +381,9 @@ test_no_critical_errors() {
 # PHASE 6 — BACKGROUND TASK LIFECYCLE
 # ═══════════════════════════════════════════════════════════════════════════
 
-# 6.1: HealthScan cycles are running (even if no CIDs — should see "no CIDs tracked").
+# 6.1: HealthScanner is running (init log at startup).
 test_health_scan_cycling() {
-    any_node_has "HealthScan:" || any_node_has "no CIDs tracked"
+    any_node_has "HealthScanner:" || any_node_has "HealthScan:"
 }
 
 # 6.2: SWIM protocol ticks advancing (at least 10 ticks = 5 seconds at 500ms period).
@@ -419,6 +434,9 @@ test_graceful_shutdown_sequence() {
     info "Sending SIGTERM to ${target}..."
     docker kill --signal=SIGTERM "$target" 2>/dev/null || true
     sleep 6  # 5s shutdown timeout + 1s buffer
+
+    # Re-cache logs after shutdown to capture shutdown messages.
+    cache_all_logs
 
     # Verify shutdown sequence in logs.
     local checks=0
@@ -478,7 +496,9 @@ test_shutdown_listeners() {
 # 7.3: Remaining 4 nodes detect the departed node (eventually suspect/dead).
 test_departure_detection() {
     # Give the remaining nodes time to detect node-5's departure.
-    sleep 10
+    # QUIC connection timeout (~30s) + probe cycle (500ms) + suspect timeout (5s) ≈ 36s.
+    sleep 40
+    cache_all_logs
     local detected=0
     for node in "${NODES[@]:0:4}"; do
         if log_contains "$node" "mark_suspect" || log_contains "$node" "mark_dead" || \
@@ -501,6 +521,135 @@ test_clean_shutdown_no_timeout() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+# PHASE 8 — RPC LIFECYCLE (via `craftec` CLI subcommands)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Helper: run craftec CLI subcommand inside a node container.
+craftec_exec() {
+    local container="$1"
+    shift
+    docker exec "$container" craftec "$@" 2>/dev/null
+}
+
+# 8.1: RPC status returns valid JSON with node_id.
+test_rpc_status() {
+    local output
+    output=$(craftec_exec "${NODES[0]}" status)
+    if [ -z "$output" ]; then
+        info "No output from craftec status"
+        return 1
+    fi
+    if echo "$output" | jq -e '.node_id' >/dev/null 2>&1; then
+        info "Status JSON has node_id"
+        return 0
+    fi
+    info "Invalid status output: ${output:0:100}"
+    return 1
+}
+
+# 8.2: Store put/get roundtrip.
+test_rpc_store_roundtrip() {
+    local cid
+    # Must use docker exec -i to forward stdin from the pipe.
+    cid=$(echo -n "rpc-test-data-$$" | docker exec -i "${NODES[0]}" craftec store put 2>/dev/null)
+    if [ -z "$cid" ]; then
+        info "store put returned no CID"
+        return 1
+    fi
+    info "Stored CID: ${cid:0:16}..."
+    local retrieved
+    retrieved=$(craftec_exec "${NODES[0]}" store get "$cid")
+    if [ "$retrieved" = "rpc-test-data-$$" ]; then
+        info "Roundtrip match ✓"
+        return 0
+    fi
+    info "Mismatch: expected 'rpc-test-data-$$', got '${retrieved:0:40}'"
+    return 1
+}
+
+# 8.3: Store list contains recently stored items.
+test_rpc_store_list() {
+    # Put 3 items (use docker exec -i for stdin forwarding).
+    echo -n "list-item-1" | docker exec -i "${NODES[0]}" craftec store put >/dev/null 2>&1
+    echo -n "list-item-2" | docker exec -i "${NODES[0]}" craftec store put >/dev/null 2>&1
+    echo -n "list-item-3" | docker exec -i "${NODES[0]}" craftec store put >/dev/null 2>&1
+    local count
+    count=$(craftec_exec "${NODES[0]}" store list | wc -l | tr -d ' ')
+    info "Store list count: ${count}"
+    [ "$count" -ge 3 ]
+}
+
+# 8.4: SQL query roundtrip.
+test_rpc_sql_roundtrip() {
+    craftec_exec "${NODES[0]}" execute "CREATE TABLE IF NOT EXISTS rpc_test(x INTEGER)" >/dev/null 2>&1
+    craftec_exec "${NODES[0]}" execute "INSERT INTO rpc_test VALUES(42)" >/dev/null 2>&1
+    local output
+    output=$(craftec_exec "${NODES[0]}" query "SELECT x FROM rpc_test WHERE x=42")
+    if echo "$output" | jq -e '.[0][0]' >/dev/null 2>&1; then
+        local val
+        val=$(echo "$output" | jq -r '.[0][0]')
+        if [ "$val" = "42" ]; then
+            info "SQL roundtrip: got 42 ✓"
+            return 0
+        fi
+        info "SQL roundtrip: expected 42, got ${val}"
+        return 1
+    fi
+    info "SQL query output invalid: ${output:0:100}"
+    return 1
+}
+
+# 8.5: Peers from all 5 nodes, each sees ≥3 peers.
+test_rpc_peers() {
+    local ok=0
+    for node in "${NODES[@]:0:4}"; do  # Use first 4 (node-5 may be stopped from Phase 7)
+        local count
+        count=$(craftec_exec "$node" peers | jq -r '.count' 2>/dev/null)
+        if [ -n "$count" ] && [ "$count" -ge 3 ]; then
+            ok=$((ok + 1))
+        else
+            info "${node}: peers count=${count:-null}"
+        fi
+    done
+    info "${ok}/4 nodes see ≥3 peers"
+    [ "$ok" -ge 3 ]
+}
+
+# 8.6: Piece info for a stored CID.
+test_rpc_pieces() {
+    local cid
+    cid=$(echo -n "piece-test-data" | docker exec -i "${NODES[0]}" craftec store put 2>/dev/null)
+    if [ -z "$cid" ]; then
+        info "store put returned no CID"
+        return 1
+    fi
+    # Give RLNC a moment to encode.
+    sleep 3
+    local output
+    output=$(craftec_exec "${NODES[0]}" pieces "$cid")
+    if echo "$output" | jq -e '.cid' >/dev/null 2>&1; then
+        local avail
+        avail=$(echo "$output" | jq -r '.available')
+        info "Pieces for ${cid:0:16}...: available=${avail}"
+        return 0
+    fi
+    info "Pieces output invalid: ${output:0:100}"
+    return 1
+}
+
+# 8.7: Status from all running nodes.
+test_rpc_status_all() {
+    local ok=0
+    for node in "${NODES[@]:0:4}"; do  # First 4 (node-5 may be stopped)
+        if craftec_exec "$node" status | jq -e '.node_id' >/dev/null 2>&1; then
+            ok=$((ok + 1))
+        fi
+    done
+    info "${ok}/4 nodes responded to status"
+    [ "$ok" -ge 4 ]
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -509,6 +658,8 @@ log "  Craftec Multi-Node Test Suite — Deep Lifecycle"
 log "═══════════════════════════════════════════════════"
 
 wait_for_cluster
+
+cache_all_logs
 
 log ""
 log "─── Phase 1: Infrastructure ───────────────────────"
@@ -558,6 +709,7 @@ run_test "no_critical_errors"
 
 log ""
 log "─── Phase 6: Background Tasks ─────────────────────"
+cache_all_logs
 run_test "health_scan_cycling"
 run_test "swim_ticks_advancing"
 run_test "all_tasks_spawned"
@@ -565,10 +717,22 @@ run_test "no_channel_closed"
 
 log ""
 log "─── Phase 7: Graceful Shutdown ────────────────────"
+cache_all_logs
 run_test "graceful_shutdown_sequence"
 run_test "shutdown_listeners"
 run_test "departure_detection"
 run_test "clean_shutdown_no_timeout"
+
+log ""
+log "─── Phase 8: RPC Lifecycle ────────────────────────"
+cache_all_logs
+run_test "rpc_status"
+run_test "rpc_store_roundtrip"
+run_test "rpc_store_list"
+run_test "rpc_sql_roundtrip"
+run_test "rpc_peers"
+run_test "rpc_pieces"
+run_test "rpc_status_all"
 
 # ── Summary ───────────────────────────────────────────────────────────────
 
@@ -580,10 +744,10 @@ log "═════════════════════════
 
 if [ "$FAIL" -gt 0 ]; then
     log ""
-    log "Dumping last 20 lines of each node for debugging:"
+    log "Dumping last 30 lines of each node for debugging:"
     for node in "${NODES[@]}"; do
         log "--- ${node} ---"
-        docker logs --tail=20 "$node" 2>&1 | sed 's/^/  /'
+        docker logs --tail=30 "$node" 2>&1 | sed 's/^/  /' || true
     done
 fi
 

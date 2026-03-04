@@ -665,10 +665,12 @@ dependencies = [
 name = "craftec-net"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bytes",
  "craftec-crypto",
  "craftec-types",
  "dashmap",
+ "hex",
  "iroh",
  "parking_lot",
  "postcard",
@@ -695,6 +697,7 @@ dependencies = [
  "craftec-types",
  "craftec-vfs",
  "dashmap",
+ "hex",
  "postcard",
  "serde",
  "serde_json",

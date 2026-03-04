@@ -15,7 +15,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use craftec_types::{NodeId, WireMessage};
+use craftec_types::{NodeId, RpcRequest, RpcResponse, WireMessage};
 
 /// A boxed, heap-allocated future returned by [`ConnectionHandler::handle_message`].
 ///
@@ -60,6 +60,20 @@ impl ConnectionHandler for NullHandler {
         tracing::trace!(peer = %from, "NullHandler: discarding message");
         Box::pin(async move { None })
     }
+}
+
+// ── RPC handler ─────────────────────────────────────────────────────────────
+
+/// A boxed future returned by [`RpcHandler::handle_request`].
+pub type RpcHandlerFuture = Pin<Box<dyn Future<Output = RpcResponse> + Send + 'static>>;
+
+/// Trait for processing incoming RPC requests on the `/craftec/rpc/1` ALPN.
+///
+/// Mirrors the [`ConnectionHandler`] pattern but uses bidi QUIC streams for
+/// request-response semantics instead of uni-directional fire-and-forget.
+pub trait RpcHandler: Send + Sync + 'static {
+    /// Process a single RPC request from `from` and return a response.
+    fn handle_request(&self, from: NodeId, req: RpcRequest) -> RpcHandlerFuture;
 }
 
 #[cfg(test)]

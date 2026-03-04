@@ -22,4 +22,4 @@ pub use error::{CraftecError, Result};
 pub use event::Event;
 pub use identity::{NodeId, NodeKeypair, Signature};
 pub use piece::{CodedPiece, GF_ORDER, HomMAC, K_DEFAULT, PAGE_SIZE, PieceId, PieceIndex};
-pub use wire::{WireMessage, decode, encode};
+pub use wire::{RpcRequest, RpcResponse, RpcValue, WireMessage, decode, encode};

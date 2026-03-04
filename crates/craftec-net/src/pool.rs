@@ -63,10 +63,10 @@ impl ConnectionPool {
     pub fn get(&self, node_id: &NodeId) -> Option<Connection> {
         if let Some(mut entry) = self.connections.get_mut(node_id) {
             entry.last_used = Instant::now();
-            tracing::debug!(peer = %node_id, "ConnectionPool: cache hit");
+            tracing::trace!(peer = %node_id, "ConnectionPool: cache hit");
             Some(entry.connection.clone())
         } else {
-            tracing::debug!(peer = %node_id, "ConnectionPool: cache miss");
+            tracing::trace!(peer = %node_id, "ConnectionPool: cache miss");
             None
         }
     }

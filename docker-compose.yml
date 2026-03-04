@@ -25,9 +25,11 @@ services:
       CRAFTEC_DATA_DIR: /data
       CRAFTEC_LISTEN_PORT: "4433"
       CRAFTEC_BOOTSTRAP_PEERS: ""
+      CRAFTEC_HEALTH_SCAN_INTERVAL_SECS: "3600"
       RUST_LOG: info,craftec=debug
     volumes:
       - node1-data:/data
+      - bootstrap-data:/bootstrap
     ports:
       - "4433:4433/udp"
 
@@ -43,9 +45,11 @@ services:
       CRAFTEC_DATA_DIR: /data
       CRAFTEC_LISTEN_PORT: "4433"
       CRAFTEC_BOOTSTRAP_PEERS: "172.28.1.1:4433"
+      CRAFTEC_HEALTH_SCAN_INTERVAL_SECS: "3600"
       RUST_LOG: info,craftec=debug
     volumes:
       - node2-data:/data
+      - bootstrap-data:/bootstrap
     depends_on:
       - node-1
 
@@ -61,9 +65,11 @@ services:
       CRAFTEC_DATA_DIR: /data
       CRAFTEC_LISTEN_PORT: "4433"
       CRAFTEC_BOOTSTRAP_PEERS: "172.28.1.1:4433"
+      CRAFTEC_HEALTH_SCAN_INTERVAL_SECS: "3600"
       RUST_LOG: info,craftec=debug
     volumes:
       - node3-data:/data
+      - bootstrap-data:/bootstrap
     depends_on:
       - node-1
 
@@ -79,9 +85,11 @@ services:
       CRAFTEC_DATA_DIR: /data
       CRAFTEC_LISTEN_PORT: "4433"
       CRAFTEC_BOOTSTRAP_PEERS: "172.28.1.1:4433"
+      CRAFTEC_HEALTH_SCAN_INTERVAL_SECS: "3600"
       RUST_LOG: info,craftec=debug
     volumes:
       - node4-data:/data
+      - bootstrap-data:/bootstrap
     depends_on:
       - node-1
 
@@ -97,9 +105,11 @@ services:
       CRAFTEC_DATA_DIR: /data
       CRAFTEC_LISTEN_PORT: "4433"
       CRAFTEC_BOOTSTRAP_PEERS: "172.28.1.1:4433"
+      CRAFTEC_HEALTH_SCAN_INTERVAL_SECS: "3600"
       RUST_LOG: info,craftec=debug
     volumes:
       - node5-data:/data
+      - bootstrap-data:/bootstrap
     depends_on:
       - node-1
 
@@ -114,7 +124,7 @@ services:
     volumes:
       - ./tests/docker:/tests:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
-    entrypoint: ["sh", "-c", "apk add --quiet --no-progress bash coreutils; bash /tests/run_all.sh"]
+    entrypoint: ["sh", "-c", "apk add --quiet --no-progress bash coreutils jq; bash /tests/run_all.sh"]
     depends_on:
       - node-1
       - node-2
@@ -128,3 +138,4 @@ volumes:
   node3-data:
   node4-data:
   node5-data:
+  bootstrap-data:
