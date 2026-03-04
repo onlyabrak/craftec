@@ -1,14 +1,18 @@
 //! [`RepairExecutor`] — RLNC recode-and-distribute repair.
 //!
 //! When [`HealthScanner`] detects that a CID has fewer coded pieces than the
-//! target redundancy, the `RepairExecutor` orchestrates repair:
+//! target redundancy (n = 2k + 16), the `RepairExecutor` orchestrates repair:
 //!
-//! 1. **Fetch** ≥2 coded pieces from peers known to hold them (via [`PieceTracker`]).
-//! 2. **Recode** — combine them into a new coded piece using [`RlncEngine`].
-//!    **This is not decoding.** Recoding is a linear combination over GF(2⁸); the
-//!    original data is never reconstructed.
-//! 3. **Distribute** — send the new coded piece to a peer that is missing a piece
-//!    for this CID, chosen uniformly at random.
+//! 1. **Election** — compute deficit, rank holders with ≥2 pieces by quality,
+//!    check if this node is in the top-N (where N = deficit). Multiple nodes
+//!    repair in parallel — each elected node produces 1 new piece.
+//! 2. **Recode** — combine ≥2 locally-held coded pieces into a new coded piece
+//!    using [`RlncEngine`]. **This is not decoding.** Recoding is a linear
+//!    combination over GF(2⁸); the original data is never reconstructed.
+//!    **No network fetch needed** — the repair node already holds ≥2 pieces.
+//! 3. **Distribute** — send the new coded piece to a peer, prioritising peers
+//!    with exactly 1 piece (so they reach ≥2 and can join future repair),
+//!    then peers with 0 pieces.
 //!
 //! # Why recode, not decode?
 //!

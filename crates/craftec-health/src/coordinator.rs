@@ -1,7 +1,7 @@
 //! [`NaturalSelectionCoordinator`] — deterministic coordinator election for repairs.
 //!
-//! When a piece shortage is detected, one node must be elected to orchestrate
-//! the repair: fetch coded pieces, recode, and distribute.  The Natural Selection
+//! When a piece shortage is detected, the top-N nodes (where N = deficit) are
+//! elected to each produce 1 repair piece: recode from local pieces and distribute.  The Natural Selection
 //! algorithm avoids randomness and instead uses a deterministic total order over
 //! node quality metrics, making the election verifiable by any participant.
 //!

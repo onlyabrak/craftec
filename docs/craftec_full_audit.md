@@ -74,7 +74,7 @@ All types fully implemented: `Cid` (32-byte BLAKE3), `NodeId`/`NodeKeypair` (Ed2
 
 - `HealthScanner`: periodic scan of PieceTracker, configurable scan_percent (default 1% = spec-correct), emits `RepairRequest` via mpsc channel. `scan_cycle` iterates tracked CIDs, checks available count vs target (`ceil(redundancy(k) * k)` for k=32). Severity classification: critical (<k), warning (<target), healthy.
 - `PieceTracker`: DashMap<Cid, Vec<PieceHolder>> tracking per-CID piece availability. `record_piece`, `remove_node` (cascades across all CIDs), `available_count`.
-- `RepairExecutor`: receives RepairRequests, fetches pieces from peers via endpoint, recodes via RLNC engine, distributes new piece. Well-structured.
+- `RepairExecutor`: receives RepairRequests, recodes from locally-held pieces via RLNC engine, distributes new piece. Well-structured. **Note:** Current implementation incorrectly fetches from peers — should recode from local pieces only (node holds ≥2).
 - **Observations**:
   - Natural Selection Coordinator (spec §30: rank by uptime/reputation/NodeID) is NOT implemented — any node holding pieces acts as coordinator. This means duplicate repair work at scale.
   - No "1 piece per CID per cycle" rate limiting (spec §30).
@@ -149,14 +149,14 @@ All types fully implemented: `Cid` (32-byte BLAKE3), `NodeId`/`NodeKeypair` (Ed2
 |------|------|:---:|-------|
 | 1 | Health scanner runs periodically | YES | HealthScanner with configurable interval |
 | 2 | Query piece availability per CID | YES | PieceTracker.available_count() |
-| 3 | Compute piece rank, detect under-replication | YES | Severity classification works |
-| 4 | Fetch coded pieces from peers | YES | RepairExecutor uses endpoint |
+| 3 | Check total coded piece count vs target (2k+16) | YES | Severity classification works |
+| 4 | Recode from locally-held pieces (≥2 required) | **WRONG** | Current impl fetches from peers — should recode from local store |
 | 5 | Verify HomMAC tags | PARTIAL | HomMAC verify exists but not called in repair path |
 | 6 | Recode with fresh coefficients | YES | RlncRecoder.recode() |
 | 7 | Distribute new piece | YES | RepairExecutor distributes |
 | 8 | Update availability map | PARTIAL | PieceTracker updated |
 
-**Repair path verdict**: Structurally complete. Missing HomMAC verification on fetched pieces (Step 5) and Natural Selection Coordinator for dedup.
+**Repair path verdict**: Structurally complete but uses wrong repair model. Step 4 fetches from peers instead of recoding from local pieces. Missing: parallel repair (top-N election based on deficit), scan eligibility filter (≥2 local pieces), distribution priority (1-piece holders first), HomMAC verification on received pieces, correct target formula (2k+16).
 
 ### 2.4 Agent Execution Path (Spec §39: load → instantiate → execute → terminate)
 

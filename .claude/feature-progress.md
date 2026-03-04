@@ -46,11 +46,11 @@
 - All 289 tests pass
 
 ### Phase 3 (completed)
-- Moved PendingFetches to craftec-net (shared between handler and repair)
-- Updated RepairExecutor to take PendingFetches, real network fetch with 10s timeout
+- Moved PendingFetches to craftec-net (used for read path piece fetching, NOT for repair)
+- RepairExecutor wired with network endpoint for distribution
 - Scanner.run() now takes repair_tx channel, forwards RepairRequests
 - Node wiring: mpsc channel scanner→executor, RepairExecutor spawned as background task
-- craftec-node's pending.rs now re-exports from craftec-net
+- **NOTE:** Repair currently fetches from peers — needs refactor to recode from local pieces only (RLNC design: node holds ≥2 pieces, no network fetch for recode input)
 - All 293 tests pass
 
 ### Phase 4 (completed)

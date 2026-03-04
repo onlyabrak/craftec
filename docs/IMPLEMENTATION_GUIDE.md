@@ -20,7 +20,7 @@
 | `craftec-vfs` | **DONE** | Page cache, page index, snapshot isolation, commit pipeline, CidVfs | Not wired to real SQLite VFS yet |
 | `craftec-sql` | **STUBBED** | Ownership checks, CAS versioning, RPC write signature verification | `execute()` fakes SQL as raw page bytes; `query()` always returns `Vec::new()` |
 | `craftec-net` | **MOSTLY DONE** | SWIM state machine, DHT in-memory, ConnectionPool, iroh Endpoint scaffolding | SWIM probes not dispatched; handler replies discarded; DHT has no gossip/TTL |
-| `craftec-health` | **PARTIALLY STUBBED** | Natural selection coordinator, PieceTracker, HealthScanner scan logic | `fetch_pieces()` returns zero-filled placeholder; scanner doesn't forward to RepairExecutor |
+| `craftec-health` | **PARTIALLY STUBBED** | Natural selection coordinator, PieceTracker, HealthScanner scan logic | Repair uses network fetch instead of local recode; parallel repair (top-N election) not implemented; distribution priority (1-piece holders first) missing |
 | `craftec-com` | **PARTIALLY STUBBED** | Wasmtime ComRuntime executes real WASM; agent lifecycle state machine; `craft_log` works | `craft_store_get/put`, `craft_sql_query`, `craft_sign` all stub-return 0; scheduler sets Running state but never executes |
 | `craftec-node` | **STRUCTURALLY COMPLETE** | Starts all subsystems; graceful shutdown; SIGINT handling | `LoggingHandler` discards all inbound messages; event bus only logs; no SQL DB init; no SWIM probe dispatch |
 | `craftec-tests` | **PARTIAL** | 10 integration tests: RLNC, SWIM in-process, wire round-trips, E2E pipeline | No real networking; no SQL tests; no health repair integration |
@@ -793,7 +793,7 @@ impl RlncRecoder {
 }
 ```
 
-**Repair bandwidth advantage:** Recoding only requires 1 output piece but must read ≥ 2 input pieces. This is far cheaper than Reed-Solomon repair (which requires K pieces, then re-encode). A repair node fetching 2 pieces and generating 1 recoded piece uses ~2× the piece bandwidth regardless of K.
+**Repair bandwidth advantage:** A repair node recodes from its own ≥2 locally-held pieces — no network fetch needed for recode input. This is far cheaper than Reed-Solomon repair (which requires fetching K pieces to reconstruct, then re-encode). The only network cost per repair is distributing 1 new coded piece to a non-holder.
 
 #### Generation Engine (engine.rs)
 
@@ -1867,11 +1867,13 @@ To verify: `swim.alive_members()` should return each other's NodeIds.
 
 ### craftec-health
 
-**Current state:** Natural selection coordinator (DONE), PieceTracker (DONE), HealthScanner scan logic (DONE). `fetch_pieces()` returns zero-filled placeholders. Scanner logs RepairRequests but doesn't forward them to RepairExecutor.
+**Current state:** Natural selection coordinator (DONE), PieceTracker (DONE), HealthScanner scan logic (DONE). Scanner forwards RepairRequests to RepairExecutor via mpsc channel.
 
-**What needs to be built:** Real piece fetch response rendezvous, scanner-to-executor wiring.
+**What needs to be built:** Parallel repair (top-N election), local recode from own pieces, distribution priority (1-piece holders first).
 
 #### HealthScan: 1% Per Cycle, Full Coverage Every ~8 Hours
+
+**Scan eligibility:** Only nodes holding ≥2 coded pieces for a CID participate in health scanning for that CID. This is because ≥2 pieces are required to recode. If a node holds only 1 piece, it cannot repair — it can only be a *distribution target* for a newly recoded piece.
 
 ```rust
 pub struct HealthScanner {
@@ -1884,30 +1886,37 @@ pub struct HealthScanner {
 
 impl HealthScanner {
     /// One scan cycle: take 1% of tracked CIDs starting from cursor, evaluate each.
+    /// Only CIDs where this node holds ≥2 pieces are eligible for repair evaluation.
     pub async fn scan_cycle(&self) -> Result<Vec<RepairRequest>> {
         let sorted_cids = self.piece_tracker.sorted_cids();  // deterministic order
         let total = sorted_cids.len();
         if total == 0 { return Ok(vec![]); }
 
         let batch_size = ((total as f64 * self.scan_percent).ceil() as usize).max(1);
-        let start = self.last_scan_index.load(Ordering::SeqCst) % total;
+        let start = self.last_scan_index.load(Ordering::Acquire) % total;
         let end = (start + batch_size).min(total);
 
         let mut repair_needed = Vec::new();
         for cid in &sorted_cids[start..end] {
+            // Only evaluate CIDs where this node holds ≥2 pieces (can recode)
+            let local_pieces = self.piece_tracker.local_piece_count(cid);
+            if local_pieces < 2 { continue; }
+
             if let Some(req) = self.evaluate_cid(cid) {
                 repair_needed.push(req);
             }
         }
 
         // Advance cursor (wrap around for continuous coverage)
-        self.last_scan_index.store(end % total, Ordering::SeqCst);
+        self.last_scan_index.store((start + batch_size) % total, Ordering::Release);
         Ok(repair_needed)
     }
 
     fn evaluate_cid(&self, cid: &Cid) -> Option<RepairRequest> {
+        // Query DHT for total coded piece count across the network
         let available = self.piece_tracker.available_count(cid);
-        let k = DEFAULT_K;
+        let k = self.piece_tracker.get_k(cid).unwrap_or(DEFAULT_K);
+        // Target = k × (2.0 + 16/k) = 2k + 16
         let target = target_piece_count(k);
 
         if available < k {
@@ -1919,33 +1928,47 @@ impl HealthScanner {
         }
     }
 }
+
+/// Target piece count: n = k × redundancy(k) = k × (2.0 + 16/k) = 2k + 16.
+/// K=8 → n=32 coded pieces.  K=32 → n=80 coded pieces.
+fn target_piece_count(k: u32) -> u32 {
+    2 * k + 16
+}
 ```
 
 **Coverage calculation:** 1% per cycle × 5-minute interval = 100 cycles for full coverage. 100 × 5 min = 500 min ≈ 8.3 hours. Exactly matches spec §30: "100% of held CIDs covered per full pass... full coverage every ~8 hours."
 
 **CID ordering:** `sorted_cids()` returns CIDs sorted by their byte value. Combined with a rolling cursor, this ensures every CID is scanned within 100 cycles regardless of which CIDs are added/removed between cycles.
 
-#### Tracker: Per-CID Replica Count
+#### Tracker: Per-CID Coded Piece Count
+
+**RLNC key property:** Every coded piece is unique — each has its own random GF(2^8) coefficient vector. There are no "piece indices" as in Reed-Solomon. The tracker counts how many distinct nodes hold coded pieces for each CID across the network.
 
 ```rust
 pub struct PieceHolder {
     pub node_id: NodeId,
-    pub piece_index: u32,
     pub last_seen: Instant,
 }
 
 pub struct PieceTracker {
+    /// Cid → list of nodes holding coded pieces for this CID.
     availability: Arc<DashMap<Cid, Vec<PieceHolder>>>,
+    /// Cid → K value used for RLNC encoding (variable-K support).
+    k_values: Arc<DashMap<Cid, u32>>,
 }
 
 impl PieceTracker {
-    /// Record that node_id holds piece_index for cid.
-    /// Updates last_seen if the (node_id, piece_index) pair already exists.
+    /// Record that node_id holds a coded piece for cid.
+    /// Updates last_seen if the node already has a record.
     pub fn record_piece(&self, cid: &Cid, holder: PieceHolder)
 
-    /// Count of UNIQUE piece_index values (not node count).
-    /// A CID with available_count >= k can be decoded.
+    /// Total coded piece count across the network for this CID.
+    /// When count < target (2k+16) → under-replicated.
     pub fn available_count(&self, cid: &Cid) -> u32
+
+    /// How many pieces THIS node holds locally for a CID.
+    /// Needed to determine scan eligibility (≥2 required for recode).
+    pub fn local_piece_count(&self, cid: &Cid) -> u32
 
     pub fn get_holders(&self, cid: &Cid) -> Vec<PieceHolder>
 
@@ -1957,15 +1980,21 @@ impl PieceTracker {
 
     /// Sorted by CID bytes — for deterministic scanner cursor.
     pub fn sorted_cids(&self) -> Vec<Cid>
+
+    /// Record the K value used for encoding this CID (first-writer-wins).
+    pub fn record_k(&self, cid: &Cid, k: u32)
+    pub fn get_k(&self, cid: &Cid) -> Option<u32>
 }
 ```
 
-**Population:** The PieceTracker is currently never populated in the running node. It must be populated from:
+**Population:** The PieceTracker is populated from:
 1. `HealthReport` messages received from peers (inbound message routing)
 2. `ProviderAnnounce` messages (when a node announces it holds pieces for a CID)
 3. Local: when this node stores a coded piece, record itself as a holder
 
-#### Natural Selection Coordinator
+#### Natural Selection Coordinator — Parallel Repair
+
+**Key insight:** Repair is NOT single-coordinator. When a CID is short by N pieces, the top-N ranked nodes **all** produce 1 new piece each in the same cycle. This is parallel self-coordinating repair — no bottleneck, no election protocol.
 
 ```rust
 pub struct NodeRanking {
@@ -1977,129 +2006,143 @@ pub struct NodeRanking {
 pub struct NaturalSelectionCoordinator;
 
 impl NaturalSelectionCoordinator {
-    /// Select the best-qualified node to coordinate repair for a CID.
+    /// Rank all candidate nodes by quality.
     /// Ranking: uptime DESC, reputation DESC, NodeId ASC (deterministic tiebreaker)
     /// All nodes compute the same ranking independently — no election needed.
-    pub fn select_coordinator(providers: &[NodeRanking]) -> Option<NodeId>
-
     pub fn rank_providers(providers: &[NodeRanking]) -> Vec<NodeId>
+
+    /// Determine how many nodes should repair (= deficit = target - current_count).
+    /// The top N ranked nodes are all elected to produce 1 piece each.
+    pub fn elected_repairers(
+        providers: &[NodeRanking],
+        deficit: u32,
+    ) -> Vec<NodeId>
 }
 ```
 
-**Critical design point (from spec §30, project owner constraint):** Coordinator selection is by quality (uptime/reputation/NodeID), NOT by XOR distance from the CID. RLNC pieces are distributed randomly, not by key-space proximity. A node ranked #1 by quality is the coordinator for all CIDs it holds — there's no per-CID election, just a consistent quality ranking.
+**Parallel repair mechanism:**
+1. Deficit = target (2k+16) − current coded piece count
+2. All holders with ≥2 pieces are candidates, ranked by (uptime, reputation, NodeID)
+3. Top N (= deficit) ranked nodes are all elected
+4. Each node independently computes whether it is in the top N
+5. Each elected node produces 1 new piece via local recode → N pieces repaired per cycle
+6. "1 piece per CID per cycle" is **per elected node**, not network-wide
 
-**No network synchronization needed:** All nodes holding pieces for a CID independently compute the same ranking from the same input data (uptime, reputation, NodeId). The top-ranked node acts; if it's down (detected via SWIM), the next-ranked node acts in the next cycle.
+**Critical design point (from spec §30, project owner constraint):** Coordinator selection is by quality (uptime/reputation/NodeID), NOT by XOR distance from the CID. RLNC pieces are distributed randomly, not by key-space proximity.
 
-#### Repair Flow
+**No network synchronization needed:** All nodes holding ≥2 pieces for a CID independently compute the same ranking from the same input data (uptime, reputation, NodeId). Each determines if it's in the top-N and acts accordingly. If a top-ranked node is down (detected via SWIM), the next-ranked node takes its slot naturally.
+
+#### Repair Flow — Local Recode + Distribute
+
+**Critical RLNC property:** The repair node already holds ≥2 coded pieces locally (that's the scan eligibility requirement). It recodes from its own local pieces — **no network fetch needed for recode input**. The only network operation is distributing the new coded piece to a non-holder.
 
 ```rust
 pub struct RepairExecutor {
     rlnc_engine: Arc<RlncEngine>,
+    store: Arc<ContentAddressedStore>,
     net: Arc<CraftecEndpoint>,
     tracker: Arc<PieceTracker>,
+    coordinator: NaturalSelectionCoordinator,
+    our_node_id: NodeId,
 }
 
 impl RepairExecutor {
     pub async fn execute_repair(&self, request: &RepairRequest) -> Result<()> {
         let cid = request.cid();
         let holders = self.tracker.get_holders(cid);
-        if holders.len() < 2 {
+
+        // Step 1: Am I elected to repair?
+        // Compute deficit, rank all holders with ≥2 pieces, check if we're in top-N.
+        let target_count = target_piece_count(
+            self.tracker.get_k(cid).unwrap_or(DEFAULT_K)
+        );
+        let current_count = self.tracker.available_count(cid);
+        let deficit = target_count.saturating_sub(current_count);
+        if deficit == 0 { return Ok(()); }
+
+        let rankings = self.build_rankings(&holders);
+        let elected = NaturalSelectionCoordinator::elected_repairers(&rankings, deficit);
+        if !elected.contains(&self.our_node_id) {
+            return Ok(()); // Another node handles it
+        }
+
+        // Step 2: Load ≥2 coded pieces from LOCAL store (no network fetch)
+        let local_pieces = self.store.get_local_pieces(cid, 2)?;
+        if local_pieces.len() < 2 {
             return Err(HealthError::InsufficientPieces { ... });
         }
 
-        // Step 1: Fetch ≥ 2 coded pieces from holder nodes
-        let pieces = self.fetch_pieces(cid, &holders, 2).await?;
+        // Step 3: Recode — combine with fresh random GF(2^8) coefficients (no decode)
+        let recoded = self.rlnc_engine.recode(&local_pieces).await?;
 
-        // Step 2: Recode — no decoding required (RLNC advantage)
-        let recoded = self.rlnc_engine.recode(&pieces).await
-            .map_err(|e| HealthError::RepairFailed { cid: cid.to_string(), reason: e.to_string() })?;
-
-        // Step 3: Select distribution target (non-holder alive node)
+        // Step 4: Select distribution target
+        //   Priority 1: peers with 1 piece (bring them to ≥2 so they can join future repair)
+        //   Priority 2: peers with 0 pieces (non-holders)
         let target = self.select_distribution_target(cid, &holders)?;
 
-        // Step 4: Send recoded piece to target
+        // Step 5: Send recoded piece to target
         let response = WireMessage::PieceResponse { pieces: vec![recoded] };
-        self.net.send_message(&target, &response).await
-            .map_err(|e| HealthError::RepairFailed { cid: cid.to_string(), reason: e.to_string() })?;
+        self.net.send_message(&target, &response).await?;
 
         Ok(())
     }
 
-    // CURRENTLY STUBBED — returns zero-filled placeholder
-    // NEEDED: actual network rendezvous
-    async fn fetch_pieces(
+    /// Distribution target priority:
+    /// 1. Peers holding exactly 1 piece (bring them to ≥2 so they can participate in future repair)
+    /// 2. Peers holding 0 pieces (non-holders — increases overall availability)
+    fn select_distribution_target(
         &self,
         cid: &Cid,
         holders: &[PieceHolder],
-        count: usize,
-    ) -> Result<Vec<CodedPiece>> {
-        // TODO: implement response rendezvous
-        // 1. Create a oneshot channel per expected response
-        // 2. Register in a global pending_fetches: DashMap<(NodeId, Cid), oneshot::Sender<CodedPiece>>
-        // 3. Send PieceRequest to each holder node
-        // 4. Await oneshot receiver with timeout
-        // 5. Inbound PieceResponse handler looks up sender in pending_fetches and sends
-        todo!()
-    }
-}
-```
+    ) -> Result<NodeId> {
+        let alive_peers = self.net.swim().alive_members();
+        let holder_counts = self.tracker.per_node_piece_count(cid);
 
-**Fetch response rendezvous (the missing piece):**
-
-```rust
-// In craftec-node (the assembly layer):
-pub struct PendingFetches {
-    pending: DashMap<Cid, Vec<oneshot::Sender<CodedPiece>>>,
-}
-
-impl PendingFetches {
-    pub fn register(&self, cid: Cid) -> oneshot::Receiver<CodedPiece> {
-        let (tx, rx) = oneshot::channel();
-        self.pending.entry(cid).or_default().push(tx);
-        rx
-    }
-    pub fn resolve(&self, cid: &Cid, piece: CodedPiece) {
-        if let Some((_, mut senders)) = self.pending.remove(cid) {
-            if let Some(tx) = senders.pop() {
-                let _ = tx.send(piece);
-                // Re-insert remaining senders if needed
-            }
+        // Priority 1: alive peers with exactly 1 piece
+        let single_piece: Vec<NodeId> = alive_peers.iter()
+            .filter(|id| holder_counts.get(id) == Some(&1))
+            .copied().collect();
+        if !single_piece.is_empty() {
+            return Ok(*single_piece.choose(&mut rand::thread_rng()).unwrap());
         }
+
+        // Priority 2: alive peers with 0 pieces
+        let non_holders: Vec<NodeId> = alive_peers.iter()
+            .filter(|id| !holder_counts.contains_key(id))
+            .copied().collect();
+        if !non_holders.is_empty() {
+            return Ok(*non_holders.choose(&mut rand::thread_rng()).unwrap());
+        }
+
+        // Fallback: any alive peer (small network, everyone already holds pieces)
+        alive_peers.choose(&mut rand::thread_rng())
+            .copied()
+            .ok_or_else(|| HealthError::RepairFailed { ... })
     }
 }
 ```
 
-This rendezvous is implemented in `craftec-node` (the assembly layer), not in `craftec-health` or `craftec-net`. The handler dispatches `PieceResponse` to `PendingFetches::resolve()`, which unblocks `fetch_pieces()`.
+**No `fetch_pieces()` — no `PendingFetches` for repair.** The recode input comes entirely from the local store. `PendingFetches` is only used for the **read path** (client fetching pieces to decode), not for repair.
 
 #### Scanner → Repair Wiring
 
 ```rust
-// CURRENT (broken):
-pub async fn run(&self, mut shutdown: broadcast::Receiver<()>) {
-    loop {
-        let requests = self.scan_cycle().await.unwrap_or_default();
-        for req in &requests {
-            tracing::warn!("Repair needed: {:?}", req);  // just logs
-        }
-        // ...
-    }
-}
-
-// NEEDED:
+// Scanner forwards RepairRequests via mpsc channel to RepairExecutor.
 pub async fn run(
     &self,
-    repair_tx: mpsc::Sender<RepairRequest>,   // ADD THIS
+    repair_tx: mpsc::Sender<RepairRequest>,
     mut shutdown: broadcast::Receiver<()>,
 ) {
     loop {
-        let requests = self.scan_cycle().await.unwrap_or_default();
-        for req in requests {
-            if repair_tx.send(req).await.is_err() {
-                tracing::warn!("Repair channel full or closed");
-            }
-        }
         tokio::select! {
-            _ = tokio::time::sleep(self.interval / 100) => {}
+            _ = tokio::time::sleep(self.interval.div_f64(100.0)) => {
+                let requests = self.scan_cycle().await.unwrap_or_default();
+                for req in requests {
+                    if repair_tx.send(req).await.is_err() {
+                        tracing::warn!("Repair channel full or closed");
+                    }
+                }
+            }
             _ = shutdown.recv() => break,
         }
     }
@@ -2110,6 +2153,7 @@ let (repair_tx, mut repair_rx) = mpsc::channel::<RepairRequest>(128);
 tokio::spawn(async move { scanner.run(repair_tx, shutdown_rx2).await });
 tokio::spawn(async move {
     while let Some(req) = repair_rx.recv().await {
+        // RepairExecutor checks if this node is elected before acting
         let _ = repair_executor.execute_repair(&req).await;
     }
 });
@@ -2607,9 +2651,10 @@ impl ConnectionHandler for NodeMessageHandler {
                     None
                 }
                 WireMessage::HealthReport { cid, available_pieces, target_pieces: _ } => {
+                    // Record that this node holds a coded piece for this CID.
+                    // RLNC: no piece_index — every piece is unique.
                     tracker.record_piece(&cid, PieceHolder {
                         node_id: from,
-                        piece_index: 0,  // TODO: use actual piece index
                         last_seen: Instant::now(),
                     });
                     None
@@ -2696,8 +2741,9 @@ User calls store(data):
    → DhtProviders::announce_provider(cid, our_node_id)
 
 4. [craftec-net] Distribute coded pieces to peers:
-   → Select target peers from ConnectionPool (rarest-first selection for pieces)
-   → Send WireMessage::PieceResponse { pieces } to each target
+   → Each coded piece is unique (random GF(2^8) coefficient vector) — no rarest-first
+   → Send each piece to a distinct peer that doesn't yet hold a piece for this CID
+   → Distribute n=2k+16 pieces across ≥K distinct peers
    → Targets: store pieces in their ContentAddressedStore
    → Targets: announce to DHT
 
@@ -2835,34 +2881,36 @@ Trigger: HealthScanner cycle (every 5 minutes) or PeerDisconnected event
 
 1. [craftec-health] HealthScanner::scan_cycle():
    - Take 1% of PieceTracker.sorted_cids()
-   - For each CID: evaluate_cid() → compare available_count vs target_n
+   - Only evaluate CIDs where THIS node holds ≥2 coded pieces (recode eligibility)
+   - For each eligible CID: query DHT for total coded piece count across network
+   - Compare count vs target n (= 2k + 16)
    - Emit RepairRequest::Normal or RepairRequest::Critical
 
-2. [craftec-health] RepairRequest forwarded via channel to RepairExecutor
+2. [craftec-health] RepairRequest forwarded via mpsc channel to RepairExecutor
 
 3. [craftec-health] RepairExecutor::execute_repair():
-   - Is this node the coordinator? (NaturalSelectionCoordinator.select_coordinator())
-     → Ranking: uptime DESC, reputation DESC, NodeId ASC
-     → If NOT coordinator: skip (another node handles it)
+   - Compute deficit = target - current_count
+   - Rank all holders with ≥2 pieces by (uptime DESC, reputation DESC, NodeId ASC)
+   - Am I in the top N (where N = deficit)? If NOT: skip (other nodes handle it)
+   - Top-N determination is deterministic — all nodes compute the same ranking
 
-4. [craftec-net] fetch_pieces(cid, holders, count=2):
-   - Send WireMessage::PieceRequest to 2 holder nodes
-   - Await PieceResponse via PendingFetches rendezvous
-
-5. [craftec-rlnc] RlncEngine::recode(pieces):
-   - Fresh random GF(2^8) coefficients
+4. [craftec-health] Recode from LOCAL pieces (no network fetch):
+   - Load ≥2 coded pieces from this node's ContentAddressedStore
+   - RlncEngine::recode(local_pieces): fresh random GF(2^8) coefficients
    - new_cv = Σ αᵢ * pieces[i].cv
    - new_data = Σ αᵢ * pieces[i].data
    - NO DECODE — O(piece_size) not O(k * piece_size)
 
-6. [craftec-net] Select distribution target (non-holder alive member)
+5. [craftec-net] Select distribution target:
+   Priority 1: peers with 1 piece (bring to ≥2 so they can join future repair)
+   Priority 2: peers with 0 pieces (non-holders)
    Send WireMessage::PieceResponse { pieces: [recoded_piece] }
 
-7. Target stores recoded piece, announces to DHT
+6. Target stores recoded piece, announces to DHT
    PieceTracker updated with new holder
 ```
 
-**Rate limiting (spec §30):** 1 piece per CID per cycle. Prevents repair storms during large-scale node failures. Even if 100 CIDs are under-replicated, repair proceeds at a steady 1 piece/CID/5min pace.
+**Rate limiting (spec §30):** 1 piece per CID per cycle **per elected node**. If deficit = 10, the top 10 nodes each produce 1 piece = 10 pieces repaired per cycle. Prevents repair storms while still allowing parallel recovery during large-scale failures.
 
 ### Flow 6: JOIN PATH — New node bootstraps
 
@@ -3273,19 +3321,21 @@ thiserror 2 is largely compatible with v1. Main change: `#[error(transparent)]` 
 
 #### Priority 4: craftec-health — Real Health Scanning + Repair (3–5 days)
 
-**What:** Wire scanner → repair channel. Implement real `fetch_pieces()` using `PendingFetches`. Wire event bus to populate `PieceTracker`.
+**What:** Implement parallel repair via Natural Selection. Nodes with ≥2 local pieces recode and distribute — no network fetch for recode input. Wire event bus to populate PieceTracker.
 
-**Dependencies:** Priority 3 (needs real piece exchange).
+**Dependencies:** Priority 3 (needs real piece distribution on write).
 
 **Implementation steps:**
-1. Add `repair_tx: mpsc::Sender<RepairRequest>` to `HealthScanner::run()`
-2. Wire in `CraftecNode::run()` to create `RepairExecutor`
-3. Implement `fetch_pieces()` using `PendingFetches`
-4. Wire `PeerDisconnected` event → `PieceTracker::remove_node()`
-5. Wire `ProviderAnnounce` inbound → `PieceTracker::record_piece()`
-6. Write `repair_under_replicated_cid` integration test (3 nodes, kill 1, verify repair)
+1. Fix `target_piece_count()`: target = 2k + 16 (not just the redundancy factor)
+2. Add scan eligibility filter: only evaluate CIDs where this node holds ≥2 pieces
+3. Implement `elected_repairers()`: rank holders, compute top-N from deficit
+4. Implement local recode: load pieces from own ContentAddressedStore, recode with fresh coefficients
+5. Implement distribution priority: 1-piece holders first, then non-holders
+6. Wire `PeerDisconnected` event → `PieceTracker::remove_node()`
+7. Wire `ProviderAnnounce` inbound → `PieceTracker::record_piece()`
+8. Write `repair_under_replicated_cid` integration test (5+ nodes, kill 1, verify parallel repair)
 
-**Acceptance criteria:** Kill one of three nodes holding pieces. HealthScan detects under-replication. RepairExecutor fetches pieces from surviving nodes, recodes, distributes to a new node. PieceTracker shows adequate replication.
+**Acceptance criteria:** Kill one of five nodes holding pieces. Multiple surviving nodes (those with ≥2 pieces and in top-N ranking) independently detect under-replication and each produce 1 new coded piece from local recode. Pieces distributed to 1-piece holders first, then non-holders. PieceTracker shows target replication restored.
 
 ---
 

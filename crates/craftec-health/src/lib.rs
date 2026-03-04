@@ -9,7 +9,7 @@
 //!   known CIDs per tick, identifies under-replicated pieces, and emits [`RepairRequest`]s.
 //! - **[`coordinator`]**: The [`NaturalSelectionCoordinator`] that elects a repair
 //!   coordinator for each CID using a deterministic ranking of available nodes.
-//! - **[`repair`]**: The [`RepairExecutor`] that fetches ≥2 coded pieces, recodes
+//! - **[`repair`]**: The [`RepairExecutor`] that recodes from ≥2 locally-held coded pieces
 //!   (without decoding!) using RLNC, and distributes the new piece to under-provisioned peers.
 //! - **[`tracker`]**: The [`PieceTracker`] that maintains the live map of which nodes
 //!   hold which pieces for which CIDs.

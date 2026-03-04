@@ -355,9 +355,10 @@ HealthScanner::run() loop:
     → advance cursor (Acquire/Release ordering)
 
 RepairExecutor::execute_repair():
-  → fetch ≥2 pieces from holders (10s timeout each)
-  → RLNC recode (NOT decode) — linear combination
-  → select target: prefer nodes NOT already holding pieces
+  → check if this node is in top-N elected repairers (deficit-based)
+  → load ≥2 coded pieces from LOCAL store (no network fetch for recode)
+  → RLNC recode (NOT decode) — linear combination with fresh GF(2^8) coefficients
+  → select target: priority 1 = peers with 1 piece, priority 2 = non-holders
   → distribute recoded piece via PieceResponse
 ```
 

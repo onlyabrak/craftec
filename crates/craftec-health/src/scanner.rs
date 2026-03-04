@@ -18,8 +18,8 @@
 //! | `available < k` | [`RepairRequest::Critical`] — data loss imminent |
 //! | `available < target` | [`RepairRequest::Normal`] — redundancy degraded |
 //!
-//! `target` is computed as `ceil(2.0 + 16.0 / k as f64)` — the Craftec redundancy
-//! formula.  For `k = 32`, `target = ceil(2.5) = 3`.
+//! `target` is the total coded piece count: `n = k × (2.0 + 16/k) = 2k + 16`.
+//! For `k = 32`, `target = 80`.  For `k = 8`, `target = 32`.
 //!
 //! # Shutdown
 //!
