@@ -33,8 +33,9 @@ pub struct NodeConfig {
     /// this limit is approached.
     pub max_disk_usage_bytes: u64,
 
-    /// How often (in seconds) the background health scanner runs.
-    pub health_scan_interval_secs: u64,
+    /// Seconds between each health-scan cycle (each cycle scans 1% of CIDs).
+    /// Default 300 s = 5 minutes (§30). Full coverage ≈ 100 cycles ≈ 8.3 hours.
+    pub health_scan_cycle_secs: u64,
 
     /// RLNC generation size — number of source blocks per generation.
     pub rlnc_k: u32,
@@ -55,7 +56,7 @@ impl Default for NodeConfig {
             bootstrap_peers: Vec::new(),
             max_connections: 256,
             max_disk_usage_bytes: 10 * 1024 * 1024 * 1024, // 10 GiB
-            health_scan_interval_secs: 3600,
+            health_scan_cycle_secs: 300,
             rlnc_k: 32,
             page_size: 16_384,
             log_level: "info".to_string(),

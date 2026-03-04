@@ -237,12 +237,14 @@ async fn health_scanner_detects_under_replicated_cid() {
     let node = TestNode::new().await;
     let cid = Cid::from_data(b"under-replicated");
 
-    // Record only 1 piece for this CID (well below k=32).
+    let local_node_id = NodeId::generate();
+
+    // Record this node as holding 2 pieces for scan eligibility.
     node.tracker.record_piece(
         &cid,
         PieceHolder {
-            node_id: NodeId::generate(),
-            piece_index: 0,
+            node_id: local_node_id,
+            piece_count: 2,
             last_seen: Instant::now(),
         },
     );
@@ -252,6 +254,7 @@ async fn health_scanner_detects_under_replicated_cid() {
         Arc::clone(&node.store),
         Arc::clone(&node.tracker),
         Duration::from_secs(3600),
+        local_node_id,
     )
     .with_scan_percent(1.0); // scan everything in one cycle
 
@@ -261,7 +264,7 @@ async fn health_scanner_detects_under_replicated_cid() {
         "scanner should detect under-replication"
     );
 
-    // The repair should be critical (available < k=32).
+    // The repair should be critical (available=1 node < k=32).
     for req in &repairs {
         assert_eq!(req.severity(), "critical");
     }

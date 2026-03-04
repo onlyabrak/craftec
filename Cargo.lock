@@ -654,6 +654,7 @@ dependencies = [
  "craftec-rlnc",
  "craftec-types",
  "dashmap",
+ "postcard",
  "rand 0.8.5",
  "tempfile",
  "thiserror 2.0.18",

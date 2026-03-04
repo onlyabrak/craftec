@@ -15,6 +15,7 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 rand = { workspace = true }
 dashmap = { workspace = true }
+postcard = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

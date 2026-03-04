@@ -1,9 +1,15 @@
 //! [`PieceTracker`] — live piece availability map for health monitoring.
 //!
 //! The tracker maintains a concurrent map of `Cid → Vec<PieceHolder>` recording
-//! which nodes currently hold which coded pieces for each known CID.  This map is
+//! which nodes currently hold coded pieces for each known CID.  This map is
 //! the primary data source for [`HealthScanner`] when determining whether a CID
 //! has enough redundancy.
+//!
+//! # RLNC semantics
+//!
+//! Unlike Reed-Solomon, RLNC coded pieces are unique (random GF(2⁸) coefficient
+//! vectors), so there are no "piece indices".  The tracker records one entry per
+//! node per CID, tracking how many pieces each node holds.
 //!
 //! # Update protocol
 //!
@@ -25,13 +31,17 @@ use craftec_types::{Cid, NodeId};
 
 // ── PieceHolder ─────────────────────────────────────────────────────────────
 
-/// A record indicating that `node_id` holds coded piece `piece_index` for some CID.
+/// A record indicating that `node_id` holds coded pieces for some CID.
+///
+/// RLNC pieces have no indices — each coded piece is unique (random GF(2⁸)
+/// coefficient vector).  We track `piece_count` (how many pieces this node
+/// holds) rather than individual piece indices.
 #[derive(Debug, Clone)]
 pub struct PieceHolder {
-    /// The node that holds this piece.
+    /// The node that holds pieces for this CID.
     pub node_id: NodeId,
-    /// The coded piece index within the RLNC generation for this CID.
-    pub piece_index: u32,
+    /// Number of coded pieces this node holds for this CID.
+    pub piece_count: u32,
     /// Wall-clock time when this holder record was last confirmed (via ping or announcement).
     pub last_seen: Instant,
 }
@@ -43,7 +53,7 @@ pub struct PieceHolder {
 /// Cheap to clone — all clones share the same underlying map via `Arc`.
 #[derive(Clone, Default)]
 pub struct PieceTracker {
-    /// `Cid` → list of (node, piece_index) records.
+    /// `Cid` → list of holder records (one per node).
     availability: Arc<DashMap<Cid, Vec<PieceHolder>>>,
     /// `Cid` → K value used for RLNC encoding (C7: variable-K support).
     /// First-writer-wins: once set, the K value for a CID is immutable.
@@ -57,23 +67,22 @@ impl PieceTracker {
         Self::default()
     }
 
-    /// Record that `holder.node_id` holds `holder.piece_index` for `cid`.
+    /// Record that `holder.node_id` holds pieces for `cid`.
     ///
-    /// If a record for the same `(node_id, piece_index)` pair already exists,
-    /// the `last_seen` timestamp is updated in place.
+    /// If a record for the same `node_id` already exists, the `piece_count`
+    /// is updated to the max of the existing and new values, and `last_seen`
+    /// is refreshed.
     pub fn record_piece(&self, cid: &Cid, holder: PieceHolder) {
         tracing::trace!(
             cid = %cid,
             node = %holder.node_id,
-            piece = holder.piece_index,
+            count = holder.piece_count,
             "PieceTracker: recording piece holder"
         );
         let mut entry = self.availability.entry(*cid).or_default();
-        // Update existing record if (node_id, piece_index) matches.
-        if let Some(existing) = entry
-            .iter_mut()
-            .find(|h| h.node_id == holder.node_id && h.piece_index == holder.piece_index)
-        {
+        // Update existing record if node_id matches.
+        if let Some(existing) = entry.iter_mut().find(|h| h.node_id == holder.node_id) {
+            existing.piece_count = existing.piece_count.max(holder.piece_count);
             existing.last_seen = holder.last_seen;
         } else {
             entry.push(holder);
@@ -90,19 +99,47 @@ impl PieceTracker {
             .unwrap_or_default()
     }
 
-    /// Return the number of distinct coded pieces known to be available for `cid`.
+    /// Return the total number of coded pieces available across all nodes for `cid`.
     ///
-    /// Counts unique `piece_index` values across all holders.  Multiple nodes
-    /// holding the same `piece_index` count as one piece (for threshold arithmetic).
+    /// In RLNC each piece is unique (random GF(2⁸) coefficient vector), so the
+    /// total is the sum of each holder's `piece_count`.  This is compared against
+    /// `k` (minimum pieces to reconstruct) and `target` (desired redundancy).
     pub fn available_count(&self, cid: &Cid) -> u32 {
         self.availability
             .get(cid)
-            .map(|holders| {
-                let unique: std::collections::HashSet<u32> =
-                    holders.iter().map(|h| h.piece_index).collect();
-                unique.len() as u32
+            .map(|holders| holders.iter().map(|h| h.piece_count).sum())
+            .unwrap_or(0)
+    }
+
+    /// Return how many coded pieces `node_id` holds locally for `cid`.
+    ///
+    /// Returns 0 if the node has no records for this CID.
+    pub fn local_piece_count(&self, cid: &Cid, node_id: &NodeId) -> u32 {
+        self.availability
+            .get(cid)
+            .and_then(|holders| {
+                holders
+                    .iter()
+                    .find(|h| &h.node_id == node_id)
+                    .map(|h| h.piece_count)
             })
             .unwrap_or(0)
+    }
+
+    /// Return each holder with their piece count for `cid`.
+    ///
+    /// Used by the repair executor to prioritise distribution targets:
+    /// peers with 1 piece (bring to ≥2 for repair eligibility) first.
+    pub fn holders_with_count(&self, cid: &Cid) -> Vec<(NodeId, u32)> {
+        self.availability
+            .get(cid)
+            .map(|holders| {
+                holders
+                    .iter()
+                    .map(|h| (h.node_id, h.piece_count))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Record the K value used for RLNC encoding of `cid`.
@@ -181,16 +218,9 @@ impl PieceTracker {
 
     /// Return the nodes that hold pieces for `cid`, deduplicated by node ID.
     pub fn holder_nodes(&self, cid: &Cid) -> Vec<NodeId> {
-        let mut seen = std::collections::HashSet::new();
         self.availability
             .get(cid)
-            .map(|holders| {
-                holders
-                    .iter()
-                    .filter(|h| seen.insert(h.node_id))
-                    .map(|h| h.node_id)
-                    .collect()
-            })
+            .map(|holders| holders.iter().map(|h| h.node_id).collect())
             .unwrap_or_default()
     }
 }
@@ -199,10 +229,10 @@ impl PieceTracker {
 mod tests {
     use super::*;
 
-    fn holder(node_id: NodeId, piece_index: u32) -> PieceHolder {
+    fn holder(node_id: NodeId, piece_count: u32) -> PieceHolder {
         PieceHolder {
             node_id,
-            piece_index,
+            piece_count,
             last_seen: Instant::now(),
         }
     }
@@ -219,25 +249,38 @@ mod tests {
         let cid = Cid::from_data(b"content");
         let node = NodeId::generate();
 
-        tracker.record_piece(&cid, holder(node, 0));
+        tracker.record_piece(&cid, holder(node, 1));
         let holders = tracker.get_holders(&cid);
         assert_eq!(holders.len(), 1);
         assert_eq!(holders[0].node_id, node);
     }
 
     #[test]
-    fn available_count_unique_pieces() {
+    fn available_count_sums_piece_counts() {
         let tracker = PieceTracker::new();
         let cid = Cid::from_data(b"pieces");
         let n1 = NodeId::generate();
         let n2 = NodeId::generate();
 
-        tracker.record_piece(&cid, holder(n1, 0));
-        tracker.record_piece(&cid, holder(n2, 0)); // same piece, different node
-        tracker.record_piece(&cid, holder(n1, 1));
+        tracker.record_piece(&cid, holder(n1, 2));
+        tracker.record_piece(&cid, holder(n2, 1));
 
-        // Two unique piece indices: 0 and 1.
-        assert_eq!(tracker.available_count(&cid), 2);
+        // Sum of piece counts: 2 + 1 = 3.
+        assert_eq!(tracker.available_count(&cid), 3);
+    }
+
+    #[test]
+    fn available_count_dedup_same_node() {
+        let tracker = PieceTracker::new();
+        let cid = Cid::from_data(b"dedup");
+        let n1 = NodeId::generate();
+
+        tracker.record_piece(&cid, holder(n1, 1));
+        tracker.record_piece(&cid, holder(n1, 3)); // same node, more pieces
+
+        // piece_count should be max(1, 3) = 3.
+        assert_eq!(tracker.available_count(&cid), 3);
+        assert_eq!(tracker.local_piece_count(&cid, &n1), 3);
     }
 
     #[test]
@@ -248,13 +291,44 @@ mod tests {
     }
 
     #[test]
+    fn local_piece_count_returns_count() {
+        let tracker = PieceTracker::new();
+        let cid = Cid::from_data(b"local");
+        let n1 = NodeId::generate();
+        let n2 = NodeId::generate();
+
+        tracker.record_piece(&cid, holder(n1, 5));
+        tracker.record_piece(&cid, holder(n2, 2));
+
+        assert_eq!(tracker.local_piece_count(&cid, &n1), 5);
+        assert_eq!(tracker.local_piece_count(&cid, &n2), 2);
+        assert_eq!(tracker.local_piece_count(&cid, &NodeId::generate()), 0);
+    }
+
+    #[test]
+    fn holders_with_count_returns_all() {
+        let tracker = PieceTracker::new();
+        let cid = Cid::from_data(b"counts");
+        let n1 = NodeId::generate();
+        let n2 = NodeId::generate();
+
+        tracker.record_piece(&cid, holder(n1, 3));
+        tracker.record_piece(&cid, holder(n2, 1));
+
+        let counts = tracker.holders_with_count(&cid);
+        assert_eq!(counts.len(), 2);
+        assert!(counts.contains(&(n1, 3)));
+        assert!(counts.contains(&(n2, 1)));
+    }
+
+    #[test]
     fn remove_node_purges_records() {
         let tracker = PieceTracker::new();
         let cid = Cid::from_data(b"multi");
         let n1 = NodeId::generate();
         let n2 = NodeId::generate();
 
-        tracker.record_piece(&cid, holder(n1, 0));
+        tracker.record_piece(&cid, holder(n1, 1));
         tracker.record_piece(&cid, holder(n2, 1));
         assert_eq!(tracker.get_holders(&cid).len(), 2);
 
@@ -269,7 +343,7 @@ mod tests {
         let tracker = PieceTracker::new();
         let cid = Cid::from_data(b"lonely");
         let node = NodeId::generate();
-        tracker.record_piece(&cid, holder(node, 0));
+        tracker.record_piece(&cid, holder(node, 1));
         assert_eq!(tracker.cid_count(), 1);
 
         tracker.remove_node(&node);
@@ -285,7 +359,7 @@ mod tests {
         // Insert a record with an artificially old last_seen.
         let old_holder = PieceHolder {
             node_id: node,
-            piece_index: 0,
+            piece_count: 1,
             last_seen: Instant::now() - Duration::from_secs(3600),
         };
         tracker.record_piece(&cid, old_holder);
@@ -303,7 +377,7 @@ mod tests {
         let cids: Vec<Cid> = (0u8..5).map(|i| Cid::from_data(&[i])).collect();
 
         for cid in &cids {
-            tracker.record_piece(cid, holder(node, 0));
+            tracker.record_piece(cid, holder(node, 1));
         }
 
         let sorted = tracker.sorted_cids();
@@ -336,7 +410,7 @@ mod tests {
         let tracker = PieceTracker::new();
         let cid = Cid::from_data(b"k-cleanup");
         let node = NodeId::generate();
-        tracker.record_piece(&cid, holder(node, 0));
+        tracker.record_piece(&cid, holder(node, 1));
         tracker.record_k(&cid, 16);
 
         // After removing the only holder, K value should be cleaned up.
@@ -353,14 +427,14 @@ mod tests {
 
         let h1 = PieceHolder {
             node_id: node,
-            piece_index: 0,
+            piece_count: 1,
             last_seen: Instant::now() - Duration::from_secs(120),
         };
         tracker.record_piece(&cid, h1);
 
         let h2 = PieceHolder {
             node_id: node,
-            piece_index: 0,
+            piece_count: 1,
             last_seen: Instant::now(),
         };
         tracker.record_piece(&cid, h2);

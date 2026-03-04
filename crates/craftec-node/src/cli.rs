@@ -237,12 +237,11 @@ fn data_dir() -> Result<PathBuf> {
         return Ok(PathBuf::from(dir));
     }
     // 2. Read from craftec.json in the current directory (matches main.rs config loading).
-    if let Ok(contents) = std::fs::read_to_string("craftec.json") {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
-            if let Some(dir) = json.get("data_dir").and_then(|v| v.as_str()) {
-                return Ok(PathBuf::from(dir));
-            }
-        }
+    if let Ok(contents) = std::fs::read_to_string("craftec.json")
+        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents)
+        && let Some(dir) = json.get("data_dir").and_then(|v| v.as_str())
+    {
+        return Ok(PathBuf::from(dir));
     }
     // 3. Default to ./data for local dev.
     Ok(PathBuf::from("./data"))

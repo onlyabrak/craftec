@@ -11,6 +11,7 @@
 //! tracks which CIDs are piece artifacts so the event handler can skip
 //! re-encoding them.
 
+use craftec_health::PieceCidLookup;
 use craftec_types::Cid;
 use dashmap::{DashMap, DashSet};
 
@@ -49,6 +50,12 @@ impl CodedPieceIndex {
     /// Get the coded-piece CIDs for a content CID.
     pub fn get(&self, content_cid: &Cid) -> Option<Vec<Cid>> {
         self.index.get(content_cid).map(|v| v.clone())
+    }
+}
+
+impl PieceCidLookup for CodedPieceIndex {
+    fn piece_cids(&self, content_cid: &Cid) -> Option<Vec<Cid>> {
+        self.get(content_cid)
     }
 }
 

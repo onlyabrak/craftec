@@ -6,8 +6,14 @@
 //! through it, processing `scan_percent` (default 1%) per cycle.  Over 100 cycles
 //! every CID is visited exactly once.
 //!
-//! At the default `interval / 100` sleep between cycles (e.g., 36 seconds when
-//! `interval = 3600s`), a full scan completes in 3600 seconds = 1 hour.
+//! At the default cycle interval of 300 s (5 minutes), a full scan completes
+//! in 100 × 300 s = 30 000 seconds ≈ 8.3 hours.
+//!
+//! # Scan eligibility
+//!
+//! A node only evaluates CIDs for which it holds ≥2 coded pieces locally.
+//! This ensures the scanner only flags CIDs it can actually repair (RLNC
+//! recoding requires ≥2 pieces).
 //!
 //! # Priority
 //!
@@ -18,8 +24,8 @@
 //! | `available < k` | [`RepairRequest::Critical`] — data loss imminent |
 //! | `available < target` | [`RepairRequest::Normal`] — redundancy degraded |
 //!
-//! `target` is the total coded piece count: `n = k × (2.0 + 16/k) = 2k + 16`.
-//! For `k = 32`, `target = 80`.  For `k = 8`, `target = 32`.
+//! `target` is the total coded piece count: `n = k × ceil(2.0 + 16/k)`.
+//! For `k = 32`, `target = 96`.  For `k = 8`, `target = 32`.
 //!
 //! # Shutdown
 //!
@@ -31,6 +37,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use craftec_obj::ContentAddressedStore;
+use craftec_types::NodeId;
 
 use crate::error::Result;
 use crate::repair::RepairRequest;
@@ -40,10 +47,18 @@ use crate::tracker::PieceTracker;
 const DEFAULT_K: u32 = 32;
 
 /// Compute the target piece count for a given `k` using the Craftec redundancy formula:
-/// `target = ceil(2.0 + 16.0 / k)`.
+/// `target = k × ceil(2.0 + 16.0 / k)`.
+///
+/// Examples:
+/// - k=32 → 32 × ceil(2.5) = 32 × 3 = 96
+/// - k=8  → 8 × ceil(4.0) = 8 × 4 = 32
+/// - k=16 → 16 × ceil(3.0) = 16 × 3 = 48
+/// - k=1  → 1 × ceil(18.0) = 1 × 18 = 18
+/// - k=4  → 4 × ceil(6.0) = 4 × 6 = 24
 fn target_piece_count(k: u32) -> u32 {
-    let k = k.max(1) as f64;
-    (2.0 + 16.0 / k).ceil() as u32
+    let k = k.max(1);
+    let factor = (2.0 + 16.0 / k as f64).ceil() as u32;
+    k * factor
 }
 
 // ── HealthScanner ─────────────────────────────────────────────────────────────
@@ -56,12 +71,13 @@ pub struct HealthScanner {
     store: Arc<ContentAddressedStore>,
     /// Fraction of all CIDs to scan per cycle (default `0.01` = 1%).
     scan_percent: f64,
-    /// Total interval over which all CIDs should be visited (default 3600 s).
-    ///
-    /// The cycle sleep time is `interval / 100` (or `interval * scan_percent`).
-    interval: Duration,
+    /// Duration between each scan cycle (default 300 s = 5 minutes).
+    /// Full coverage = 100 cycles × this value.
+    cycle_interval: Duration,
     /// Live piece availability map.
     piece_tracker: Arc<PieceTracker>,
+    /// This node's identity — used for scan eligibility (≥2 local pieces).
+    node_id: NodeId,
     /// Cursor into the sorted CID list — advances each cycle, wraps at the end.
     last_scan_index: AtomicUsize,
 }
@@ -73,21 +89,24 @@ impl HealthScanner {
     ///
     /// - `store`: The content-addressed store that owns the canonical CID list.
     /// - `piece_tracker`: Shared availability tracker updated by the net layer.
-    /// - `interval`: Total time for 100% CID coverage.  Default: 3600 s.
+    /// - `cycle_interval`: Sleep between each 1%-scan cycle.  Default: 300 s (5 min).
+    /// - `node_id`: This node's identity for scan eligibility filtering.
     pub fn new(
         store: Arc<ContentAddressedStore>,
         piece_tracker: Arc<PieceTracker>,
-        interval: Duration,
+        cycle_interval: Duration,
+        node_id: NodeId,
     ) -> Self {
         tracing::info!(
-            interval_secs = interval.as_secs(),
+            cycle_secs = cycle_interval.as_secs(),
             "HealthScanner: initialised"
         );
         Self {
             store,
             scan_percent: 0.01,
-            interval,
+            cycle_interval,
             piece_tracker,
+            node_id,
             last_scan_index: AtomicUsize::new(0),
         }
     }
@@ -104,9 +123,10 @@ impl HealthScanner {
 
     /// Run a single scan cycle and return the list of [`RepairRequest`]s found.
     ///
-    /// The scanner fetches the current sorted CID list, takes `scan_percent` of
-    /// them starting from the saved cursor position, checks each one, and advances
-    /// the cursor for the next call.
+    /// The scanner fetches the current sorted CID list, filters to CIDs where
+    /// this node holds ≥2 coded pieces (scan eligibility), takes `scan_percent`
+    /// of them starting from the saved cursor position, checks each one, and
+    /// advances the cursor for the next call.
     pub async fn scan_cycle(&self) -> Result<Vec<RepairRequest>> {
         let cycle_start = std::time::Instant::now();
         // Fetch the sorted CID list from the piece tracker (canonical source of known CIDs).
@@ -117,19 +137,30 @@ impl HealthScanner {
             return Ok(Vec::new());
         }
 
-        let total = all_cids.len();
+        // Filter to CIDs where this node holds ≥2 pieces (scan eligibility).
+        let eligible_cids: Vec<_> = all_cids
+            .into_iter()
+            .filter(|cid| self.piece_tracker.local_piece_count(cid, &self.node_id) >= 2)
+            .collect();
+
+        if eligible_cids.is_empty() {
+            tracing::trace!("HealthScan: no eligible CIDs (need ≥2 local pieces) — skipping cycle");
+            return Ok(Vec::new());
+        }
+
+        let total = eligible_cids.len();
         let batch_size = ((total as f64 * self.scan_percent).ceil() as usize).max(1);
 
         // Advance the cursor, wrapping at the end (T14: use Acquire ordering).
         let start = self.last_scan_index.load(Ordering::Acquire) % total;
         let end = (start + batch_size).min(total);
 
-        let batch = &all_cids[start..end];
+        let batch = &eligible_cids[start..end];
 
         // Handle wrap-around: if the cursor reached the end, also grab from the beginning.
         let wrapped: &[craftec_types::Cid] = if start + batch_size > total {
             let overflow = (start + batch_size) - total;
-            &all_cids[..overflow.min(total)]
+            &eligible_cids[..overflow.min(total)]
         } else {
             &[]
         };
@@ -167,7 +198,7 @@ impl HealthScanner {
 
     // ── Background run loop ────────────────────────────────────────────────
 
-    /// Run the scanner indefinitely, sleeping `interval / 100` between cycles.
+    /// Run the scanner indefinitely, sleeping `cycle_interval` between cycles.
     ///
     /// Emitted [`RepairRequest`]s are forwarded to `repair_tx` for the
     /// [`RepairExecutor`] to process.  Exits cleanly on shutdown signal.
@@ -176,16 +207,14 @@ impl HealthScanner {
         repair_tx: tokio::sync::mpsc::Sender<RepairRequest>,
         mut shutdown: tokio::sync::broadcast::Receiver<()>,
     ) {
-        let cycle_sleep = self.interval.div_f64(100.0);
-
         tracing::info!(
-            cycle_sleep_ms = cycle_sleep.as_millis(),
+            cycle_interval_ms = self.cycle_interval.as_millis(),
             "HealthScanner: background loop started"
         );
 
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(cycle_sleep) => {
+                _ = tokio::time::sleep(self.cycle_interval) => {
                     match self.scan_cycle().await {
                         Ok(repairs) => {
                             for req in repairs {
@@ -257,26 +286,32 @@ mod tests {
 
     #[test]
     fn target_piece_count_k32() {
-        // 2.0 + 16/32 = 2.5 → ceil = 3
-        assert_eq!(target_piece_count(32), 3);
+        // k=32: 32 × ceil(2.0 + 16/32) = 32 × ceil(2.5) = 32 × 3 = 96
+        assert_eq!(target_piece_count(32), 96);
     }
 
     #[test]
     fn target_piece_count_k1() {
-        // 2.0 + 16/1 = 18.0 → ceil = 18
+        // k=1: 1 × ceil(2.0 + 16/1) = 1 × ceil(18.0) = 1 × 18 = 18
         assert_eq!(target_piece_count(1), 18);
     }
 
     #[test]
     fn target_piece_count_k4() {
-        // 2.0 + 16/4 = 6.0 → ceil = 6
-        assert_eq!(target_piece_count(4), 6);
+        // k=4: 4 × ceil(2.0 + 16/4) = 4 × ceil(6.0) = 4 × 6 = 24
+        assert_eq!(target_piece_count(4), 24);
     }
 
     #[test]
     fn target_piece_count_k16() {
-        // 2.0 + 16/16 = 3.0 → ceil = 3
-        assert_eq!(target_piece_count(16), 3);
+        // k=16: 16 × ceil(2.0 + 16/16) = 16 × ceil(3.0) = 16 × 3 = 48
+        assert_eq!(target_piece_count(16), 48);
+    }
+
+    #[test]
+    fn target_piece_count_k8() {
+        // k=8: 8 × ceil(2.0 + 16/8) = 8 × ceil(4.0) = 8 × 4 = 32
+        assert_eq!(target_piece_count(8), 32);
     }
 
     #[test]

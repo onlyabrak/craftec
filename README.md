@@ -105,7 +105,7 @@ On first start, a `craftec.json` configuration file is created in the working di
   "bootstrap_peers": ["peer1.example.com:4433", "peer2.example.com:4433"],
   "max_connections": 256,
   "max_disk_usage_bytes": 10737418240,
-  "health_scan_interval_secs": 3600,
+  "health_scan_cycle_secs": 300,
   "rlnc_k": 32,
   "page_size": 16384,
   "log_level": "info"

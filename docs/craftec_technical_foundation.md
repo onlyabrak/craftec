@@ -446,11 +446,11 @@ Provider records follow the standard Kademlia provider record design: each provi
 - **Record content:** A single provider record contains: NodeID (32 bytes), piece count, capabilities — well within 1 KiB.
 - **Many small records:** The DHT stores MANY small records per CID key, not one giant record listing all providers.
 - **Discovery:** Requester queries DHT for CID X → receives provider records from the K-closest DHT nodes → contacts providers in parallel.
-- **TTL:** Provider records have 24-hour TTL. Nodes re-announce before expiry (~20 hours). When a node drops pieces, the record expires naturally.
+- **TTL:** Provider records have 48-hour TTL. Nodes re-announce every 22 hours. When a node drops pieces, the record expires naturally.
 
 | Key Pattern | Purpose | TTL |
 |------------|---------|-----|
-| BLAKE3(cid) | Content provider records (one per provider node) | 24 hours |
+| BLAKE3(cid) | Content provider records (one per provider node) | 48 hours |
 | BLAKE3("manifest:" + cid) | Cached ContentManifest | 1 hour |
 
 ```rust
@@ -777,7 +777,7 @@ SIGHUP triggers hot-reload. If valid, atomically swap into Arc. Emit `config.rel
 3. Delete corrupt CIDs from local store (re-fetched from peers later).
 4. Open CraftSQL peer database. Run `PRAGMA integrity_check`. If failures, delete and let First-Run Init recreate.
 5. Identify orphaned CIDs (not referenced by any live root). Safe to evict immediately.
-6. Run local eviction pass on orphaned CIDs (two-phase mark-and-sweep with zero safety window).
+6. Run local eviction pass on orphaned CIDs (two-phase mark-and-sweep with 5.5-minute safety window, matching normal eviction §31).
 7. Verify root CID consistency: load latest root, verify all referenced CIDs are present.
 8. Write recovery summary to log. Emit `recovery.complete` event.
 
@@ -1236,10 +1236,10 @@ For any CID, multiple nodes hold pieces — any of them could coordinate repair.
 | **Depends on** | CraftOBJ (#27), CraftSQL page index (#33), Config (#13) |
 | **Depended by** | Disk Space Management (#32) |
 
-Eviction is orthogonal to the storage lifecycle. The storage lifecycle (Push → Distribution → Repair → Scaling → Degradation) manages how pieces are distributed across the network. Eviction is a separate, local decision: a node decides to drop pieces it no longer wants to hold — due to disk pressure, low reputation score for the CID, or other local policy. The network is not notified; the node simply stops announcing the provider record, and the DHT record expires naturally (24h TTL).
+Eviction is orthogonal to the storage lifecycle. The storage lifecycle (Push → Distribution → Repair → Scaling → Degradation) manages how pieces are distributed across the network. Eviction is a separate, local decision: a node decides to drop pieces it no longer wants to hold — due to disk pressure, low reputation score for the CID, or other local policy. The network is not notified; the node simply stops announcing the provider record, and the DHT record expires naturally (48h TTL).
 
 - **Drop trigger:** Disk pressure, low reputation score for the CID, age of last access, or local policy.
-- **Network notification:** None required. The node stops announcing the DHT provider record. The DHT record expires naturally after 24h TTL.
+- **Network notification:** None required. The node stops announcing the DHT provider record. The DHT record expires naturally after 48h TTL.
 - **Reference counting:** A local bookkeeping mechanism to identify orphaned local data. Not a network-wide process.
 - **Daily mark-and-sweep:** A local correctness backstop that finds orphaned local CIDs not reachable from any live root. Runs once per day; not network-coordinated.
 - **Storage lifecycle independence:** Eviction does not conflict with repair. If a node drops pieces and the network falls below redundancy target, HealthScan on other nodes detects the deficit and repairs in the next cycle.
@@ -1373,7 +1373,7 @@ Prefetch: On sequential read patterns, prefetch pages N+1 through N+8 asynchrono
 #### Publication Flow
 
 1. Receive `(database_id, new_root_cid)` from commit flow.
-2. Write DHT provider record for root CID (24h TTL). This is the primary content-routing mechanism.
+2. Write DHT provider record for root CID (48h TTL). This is the primary content-routing mechanism.
 3. Build Pkarr record: `{name: "db.{node_id}.craftec", value: root_cid_hex, ttl: 3600}`. Sign with Ed25519.
 4. Publish via Pkarr DNS-over-HTTPS.
 5. Gossip new root CID to connected peers via SWIM piggybacking (immediate notification).
@@ -1459,13 +1459,13 @@ The distinction: CraftCOM does not know or care whether a WASM invocation is eph
 
 | | |
 |--|--|
-| **What it does** | k-of-n attestation — one use case of CraftCOM general compute. Agents independently validate CraftSQL data, sign with Ed25519. No shared secrets, no DKG, no MPC for internal ops. |
+| **What it does** | k-of-n attestation — one use case of CraftCOM general compute. Two modes: (1) internal attestation uses k independent Ed25519 signatures — no shared secrets, no DKG, no MPC; (2) chain-boundary signing (Solana/Ethereum) uses FROST(Ed25519) with DKG for the boundary signer group only. |
 | **Depends on** | Agent Lifecycle (#39), Host Functions (#40), Node Identity (#17), Wire Protocol (#23) |
 | **Depended by** | Any subsystem requiring trust validation |
 
-**Flow:** Event triggers request → broadcast to n peers → each peer loads agent, validates, signs → coordinator collects k signatures → verify each (2.3µs) → broadcast combined attestation.
+**Internal attestation flow:** Event triggers request → broadcast to n peers → each peer loads agent, validates, signs with its own Ed25519 key → coordinator collects k signatures → verify each (2.3µs) → broadcast combined attestation. No shared secrets, no DKG, no MPC.
 
-FROST(Ed25519) 7-of-10: ~0.9ms for chain-boundary operations.
+**Chain-boundary signing:** FROST(Ed25519) 7-of-10 with DKG for the boundary signer group (~0.9ms per signature). DKG is scoped exclusively to chain-boundary operations — internal attestation never uses it.
 
 ---
 
@@ -1751,7 +1751,7 @@ The repair path runs entirely without a coordinator and without decoding to orig
 
 | Step | Operation |
 |------|-----------|
-| 1 | Health scanner runs (every 3600s or on PEER_DISCONNECTED). |
+| 1 | Health scanner runs (every 300s / 5 minutes, or on PEER_DISCONNECTED). |
 | 2 | Query piece availability for each CID. |
 | 3 | Compute available piece count. If < K → DATA AT RISK. If < n → under-replicated. |
 | 4 | Verify this node holds ≥2 local coded pieces. Recode from local pieces (no network fetch). Determine if this node is in the top-N elected repairers (where N = deficit). If not elected, skip. |

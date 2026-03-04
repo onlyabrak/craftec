@@ -281,14 +281,15 @@ impl CraftecNode {
         // ── Step 11: Initialize HealthScanner + PieceTracker ─────────────────
         tracing::info!("Step 11: initializing HealthScanner and PieceTracker...");
         let piece_tracker = Arc::new(PieceTracker::new());
-        let health_interval = Duration::from_secs(config.health_scan_interval_secs);
+        let cycle_interval = Duration::from_secs(config.health_scan_cycle_secs);
         let health_scanner = Arc::new(HealthScanner::new(
             Arc::clone(&store),
             Arc::clone(&piece_tracker),
-            health_interval,
+            cycle_interval,
+            *endpoint.node_id(),
         ));
         tracing::info!(
-            interval_secs = config.health_scan_interval_secs,
+            cycle_secs = config.health_scan_cycle_secs,
             "HealthScanner and PieceTracker ready"
         );
 
@@ -503,7 +504,9 @@ impl CraftecNode {
                 Arc::clone(&self.rlnc),
                 Arc::clone(&self.endpoint),
                 Arc::clone(&self.piece_tracker),
-                Arc::clone(&self.pending_fetches),
+                Arc::clone(&self.store),
+                Arc::clone(&self.piece_index) as Arc<dyn craftec_health::PieceCidLookup>,
+                *self.endpoint.node_id(),
             );
             let mut repair_shutdown = self.shutdown_tx.subscribe();
             tasks.spawn(async move {
@@ -595,17 +598,18 @@ impl CraftecNode {
                                                                     piece_index.mark_piece_cid(pcid);
                                                                     if let Ok(pcid) = store.put(&bytes).await {
                                                                         pcids.push(pcid);
-                                                                        piece_tracker.record_piece(
-                                                                            &cid,
-                                                                            craftec_health::tracker::PieceHolder {
-                                                                                node_id,
-                                                                                piece_index: pcids.len() as u32 - 1,
-                                                                                last_seen: std::time::Instant::now(),
-                                                                            },
-                                                                        );
                                                                     }
                                                                 }
                                                                 piece_index.insert(cid, pcids.clone());
+                                                                // Record this node as holding all encoded pieces for this CID.
+                                                                piece_tracker.record_piece(
+                                                                    &cid,
+                                                                    craftec_health::tracker::PieceHolder {
+                                                                        node_id,
+                                                                        piece_count: pcids.len() as u32,
+                                                                        last_seen: std::time::Instant::now(),
+                                                                    },
+                                                                );
                                                                 tracing::debug!(
                                                                     cid = %cid,
                                                                     pieces = pieces.len(),

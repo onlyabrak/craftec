@@ -118,11 +118,11 @@ fn apply_env_overrides(
         tracing::info!(count = peers.len(), "Env override: CRAFTEC_BOOTSTRAP_PEERS");
         config.bootstrap_peers = peers;
     }
-    if let Ok(val) = std::env::var("CRAFTEC_HEALTH_SCAN_INTERVAL_SECS")
+    if let Ok(val) = std::env::var("CRAFTEC_HEALTH_SCAN_CYCLE_SECS")
         && let Ok(secs) = val.parse::<u64>()
     {
-        tracing::info!(secs, "Env override: CRAFTEC_HEALTH_SCAN_INTERVAL_SECS");
-        config.health_scan_interval_secs = secs;
+        tracing::info!(secs, "Env override: CRAFTEC_HEALTH_SCAN_CYCLE_SECS");
+        config.health_scan_cycle_secs = secs;
     }
     config
 }

@@ -40,6 +40,6 @@ pub mod tracker;
 
 pub use coordinator::{NaturalSelectionCoordinator, NodeRanking};
 pub use error::HealthError;
-pub use repair::{RepairExecutor, RepairRequest};
+pub use repair::{PieceCidLookup, RepairExecutor, RepairRequest};
 pub use scanner::HealthScanner;
 pub use tracker::{PieceHolder, PieceTracker};

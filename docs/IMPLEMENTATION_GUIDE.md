@@ -306,7 +306,7 @@ pub struct NodeConfig {
     pub bootstrap_peers: Vec<String>,   // default: []
     pub max_connections: usize,         // default: 256
     pub max_disk_usage_bytes: u64,      // default: 10 GiB
-    pub health_scan_interval_secs: u64, // default: 3600
+    pub health_scan_cycle_secs: u64,    // default: 300 (5 min per cycle, full coverage ≈ 8.3h)
     pub rlnc_k: u32,                    // default: 32; NOT hot-reloadable
     pub page_size: usize,               // default: 16_384
     pub log_level: String,              // default: "info"

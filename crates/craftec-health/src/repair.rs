@@ -1,7 +1,7 @@
 //! [`RepairExecutor`] — RLNC recode-and-distribute repair.
 //!
 //! When [`HealthScanner`] detects that a CID has fewer coded pieces than the
-//! target redundancy (n = 2k + 16), the `RepairExecutor` orchestrates repair:
+//! target redundancy (n = k × ceil(2 + 16/k)), the `RepairExecutor` orchestrates repair:
 //!
 //! 1. **Election** — compute deficit, rank holders with ≥2 pieces by quality,
 //!    check if this node is in the top-N (where N = deficit). Multiple nodes
@@ -24,19 +24,27 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use craftec_net::CraftecEndpoint;
-use craftec_net::pending::PendingFetches;
+use craftec_obj::ContentAddressedStore;
 use craftec_rlnc::RlncEngine;
 use craftec_types::piece::CodedPiece;
 use craftec_types::{Cid, NodeId, WireMessage};
 
+use crate::coordinator::{NaturalSelectionCoordinator, NodeRanking};
 use crate::error::{HealthError, Result};
 use crate::tracker::PieceTracker;
 
-/// Timeout for waiting on a piece fetch response from a peer.
-const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+// ── PieceCidLookup trait ────────────────────────────────────────────────────
+
+/// Trait for looking up coded-piece CIDs for a content CID.
+///
+/// The repair executor uses this to find which piece CIDs are stored locally
+/// for a given content CID, without depending on `craftec-node` directly.
+pub trait PieceCidLookup: Send + Sync {
+    /// Return the coded-piece CIDs for `content_cid`, if any are known.
+    fn piece_cids(&self, content_cid: &Cid) -> Option<Vec<Cid>>;
+}
 
 // ── RepairRequest ────────────────────────────────────────────────────────────
 
@@ -62,7 +70,7 @@ pub enum RepairRequest {
         cid: Cid,
         /// Number of pieces currently accessible.
         available: u32,
-        /// Target piece count from the redundancy formula `2.0 + 16/k`.
+        /// Target piece count from the redundancy formula `k × ceil(2.0 + 16/k)`.
         target: u32,
     },
 }
@@ -83,6 +91,22 @@ impl RepairRequest {
             RepairRequest::Normal { .. } => "normal",
         }
     }
+
+    /// Return the target piece count (for deficit computation).
+    fn target_count(&self) -> u32 {
+        match self {
+            RepairRequest::Critical { k, .. } => *k,
+            RepairRequest::Normal { target, .. } => *target,
+        }
+    }
+
+    /// Return the currently available piece count.
+    fn available_count(&self) -> u32 {
+        match self {
+            RepairRequest::Critical { available, .. } => *available,
+            RepairRequest::Normal { available, .. } => *available,
+        }
+    }
 }
 
 // ── RepairExecutor ────────────────────────────────────────────────────────────
@@ -91,13 +115,17 @@ impl RepairRequest {
 pub struct RepairExecutor {
     /// RLNC engine for recoding (not decoding!) coded pieces.
     rlnc_engine: Arc<RlncEngine>,
-    /// Network endpoint for fetching pieces from peers and distributing new ones.
+    /// Network endpoint for distributing new pieces to peers.
     net: Arc<CraftecEndpoint>,
-    /// Piece availability tracker — provides holders to fetch from and targets to send to.
+    /// Piece availability tracker — provides holders and piece counts.
     tracker: Arc<PieceTracker>,
-    /// Rendezvous point for piece fetch responses arriving via the accept loop.
-    pending: Arc<PendingFetches>,
-    /// Monotonic counter for unique request IDs (T10).
+    /// Local content-addressed store for reading locally-held coded pieces.
+    store: Arc<ContentAddressedStore>,
+    /// Lookup for coded-piece CIDs given a content CID.
+    piece_lookup: Arc<dyn PieceCidLookup>,
+    /// This node's identity — used for election check.
+    node_id: NodeId,
+    /// Monotonic counter for unique request IDs.
     next_request_id: AtomicU64,
 }
 
@@ -107,13 +135,17 @@ impl RepairExecutor {
         rlnc_engine: Arc<RlncEngine>,
         net: Arc<CraftecEndpoint>,
         tracker: Arc<PieceTracker>,
-        pending: Arc<PendingFetches>,
+        store: Arc<ContentAddressedStore>,
+        piece_lookup: Arc<dyn PieceCidLookup>,
+        node_id: NodeId,
     ) -> Self {
         Self {
             rlnc_engine,
             net,
             tracker,
-            pending,
+            store,
+            piece_lookup,
+            node_id,
             next_request_id: AtomicU64::new(0),
         }
     }
@@ -122,16 +154,19 @@ impl RepairExecutor {
     ///
     /// # Steps
     ///
-    /// 1. Look up all known holders for `request.cid()` in the tracker.
-    /// 2. Fetch ≥2 coded pieces from distinct peers.
-    /// 3. Recode using `RlncEngine::recode` — producing a fresh coded piece.
-    /// 4. Select a target peer lacking a piece (random, uniform).
-    /// 5. Send the recoded piece to the target via `CraftecEndpoint::send_message`.
+    /// 1. Compute deficit = target - available.
+    /// 2. Collect rankings from SWIM (uptime/reputation).
+    /// 3. Rank providers via Natural Selection.
+    /// 4. Check if this node is in the top-N (where N = deficit). If not, return early.
+    /// 5. Load ≥2 local coded pieces from the store (no network fetch).
+    /// 6. Recode using `RlncEngine::recode` — producing a fresh coded piece.
+    /// 7. Select a distribution target with priority: (1) 1-piece holders, (2) 0-piece holders.
+    /// 8. Send the recoded piece to the target.
     ///
     /// # Errors
     ///
-    /// - [`HealthError::InsufficientPieces`] if fewer than 2 coded pieces can be fetched.
-    /// - [`HealthError::RepairFailed`] if distribution fails.
+    /// - [`HealthError::InsufficientPieces`] if fewer than 2 coded pieces can be loaded locally.
+    /// - [`HealthError::RepairFailed`] if recode or distribution fails.
     pub async fn execute_repair(&self, request: &RepairRequest) -> Result<()> {
         let cid = request.cid();
 
@@ -141,20 +176,55 @@ impl RepairExecutor {
             "Repair: starting repair"
         );
 
-        // Step 1: collect holders.
-        let holders = self.tracker.get_holders(cid);
-        if holders.len() < 2 {
-            return Err(HealthError::InsufficientPieces {
-                cid: cid.to_string(),
-                k: 2,
-                available: holders.len() as u32,
-            });
+        // Step 1: compute deficit.
+        let deficit = request.target_count().saturating_sub(request.available_count());
+        if deficit == 0 {
+            tracing::debug!(cid = %cid, "Repair: no deficit — skipping");
+            return Ok(());
         }
 
-        // Step 2: fetch ≥2 coded pieces.
-        let pieces = self.fetch_pieces(cid, &holders, 2).await?;
+        // Step 2: collect rankings from SWIM.
+        let holders = self.tracker.get_holders(cid);
+        let alive_members = self.net.swim().alive_members();
+        let rankings: Vec<NodeRanking> = holders
+            .iter()
+            .filter(|h| self.tracker.local_piece_count(cid, &h.node_id) >= 2)
+            .filter(|h| alive_members.contains(&h.node_id) || h.node_id == self.node_id)
+            .map(|h| {
+                // Uptime and reputation are placeholders until those layers exist.
+                // The NodeId tiebreaker ensures deterministic election.
+                NodeRanking {
+                    node_id: h.node_id,
+                    uptime_secs: 0,
+                    reputation_score: 0.5,
+                }
+            })
+            .collect();
 
-        // Step 3: recode — combine without decoding.
+        if rankings.is_empty() {
+            tracing::debug!(cid = %cid, "Repair: no eligible repairers (need ≥2 local pieces)");
+            return Ok(());
+        }
+
+        // Step 3: rank providers.
+        let ranked = NaturalSelectionCoordinator::rank_providers(&rankings);
+
+        // Step 4: check if this node is in the top-N.
+        let elected = &ranked[..ranked.len().min(deficit as usize)];
+        if !elected.contains(&self.node_id) {
+            tracing::debug!(
+                cid = %cid,
+                deficit,
+                elected_count = elected.len(),
+                "Repair: not elected for this CID — skipping"
+            );
+            return Ok(());
+        }
+
+        // Step 5: load ≥2 local coded pieces from store.
+        let pieces = self.load_local_pieces(cid).await?;
+
+        // Step 6: recode.
         let recoded =
             self.rlnc_engine
                 .recode(&pieces)
@@ -164,10 +234,10 @@ impl RepairExecutor {
                     reason: format!("RLNC recode failed: {e}"),
                 })?;
 
-        // Step 4: find a target peer that lacks pieces.
-        let target = self.select_distribution_target(cid, &holders)?;
+        // Step 7: find a target peer with distribution priority.
+        let target = self.select_distribution_target(cid)?;
 
-        // Step 5: distribute the recoded piece.
+        // Step 8: distribute the recoded piece.
         let distribute_msg = WireMessage::PieceResponse {
             pieces: vec![recoded],
             request_id: self.next_request_id.fetch_add(1, Ordering::Relaxed),
@@ -192,75 +262,56 @@ impl RepairExecutor {
 
     // ── Private helpers ────────────────────────────────────────────────────
 
-    /// Request `count` coded pieces from distinct holders via the network.
+    /// Load ≥2 locally-held coded pieces from the content-addressed store.
     ///
-    /// Sends `PieceRequest` to each holder and waits for the response via
-    /// `PendingFetches` with a 10-second timeout per peer.
-    async fn fetch_pieces(
-        &self,
-        cid: &Cid,
-        holders: &[crate::tracker::PieceHolder],
-        count: usize,
-    ) -> Result<Vec<CodedPiece>> {
-        let mut pieces = Vec::with_capacity(count);
-        let req_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-        let request_msg = WireMessage::PieceRequest {
-            cid: *cid,
-            piece_indices: vec![],
-            request_id: req_id,
-        };
+    /// Uses the piece CID lookup to find which piece CIDs belong to the
+    /// content CID, then reads and deserializes them from the local store.
+    async fn load_local_pieces(&self, cid: &Cid) -> Result<Vec<CodedPiece>> {
+        let piece_cids = self.piece_lookup.piece_cids(cid).ok_or_else(|| {
+            HealthError::InsufficientPieces {
+                cid: cid.to_string(),
+                k: 2,
+                available: 0,
+            }
+        })?;
 
-        for holder in holders.iter().take(count * 2) {
-            if pieces.len() >= count {
+        let mut pieces = Vec::new();
+        for pcid in &piece_cids {
+            if pieces.len() >= 2 {
                 break;
             }
-
-            // Register interest before sending the request to avoid a race.
-            let rx = self.pending.register(cid);
-
-            match self.net.send_message(&holder.node_id, &request_msg).await {
-                Ok(()) => {
-                    // Wait for the response with a timeout.
-                    match tokio::time::timeout(FETCH_TIMEOUT, rx).await {
-                        Ok(Ok(piece)) => {
-                            tracing::debug!(
-                                cid = %cid,
-                                peer = %holder.node_id,
-                                "Repair: fetched piece from peer"
-                            );
-                            pieces.push(piece);
-                        }
-                        Ok(Err(_)) => {
-                            tracing::debug!(
-                                cid = %cid,
-                                peer = %holder.node_id,
-                                "Repair: fetch channel closed"
-                            );
-                        }
-                        Err(_) => {
-                            tracing::debug!(
-                                cid = %cid,
-                                peer = %holder.node_id,
-                                "Repair: fetch timed out"
-                            );
-                        }
+            match self.store.get(pcid).await {
+                Ok(Some(bytes)) => match postcard::from_bytes::<CodedPiece>(&bytes) {
+                    Ok(piece) => pieces.push(piece),
+                    Err(e) => {
+                        tracing::warn!(
+                            cid = %cid,
+                            piece_cid = %pcid,
+                            error = %e,
+                            "Repair: failed to deserialize coded piece — skipping"
+                        );
                     }
+                },
+                Ok(None) => {
+                    tracing::debug!(
+                        piece_cid = %pcid,
+                        "Repair: piece CID not found in local store — skipping"
+                    );
                 }
                 Err(e) => {
                     tracing::warn!(
-                        cid = %cid,
-                        peer = %holder.node_id,
+                        piece_cid = %pcid,
                         error = %e,
-                        "Repair: fetch request send failed — trying next"
+                        "Repair: store read failed — skipping"
                     );
                 }
             }
         }
 
-        if pieces.len() < count {
+        if pieces.len() < 2 {
             return Err(HealthError::InsufficientPieces {
                 cid: cid.to_string(),
-                k: count as u32,
+                k: 2,
                 available: pieces.len() as u32,
             });
         }
@@ -270,35 +321,48 @@ impl RepairExecutor {
 
     /// Select a target node to receive the newly recoded piece.
     ///
-    /// Preference: a peer in the SWIM membership that is **not** already holding
-    /// a piece for this CID (to increase diversity).  Falls back to a random
-    /// existing holder if no new peer is available.
-    fn select_distribution_target(
-        &self,
-        cid: &Cid,
-        holders: &[crate::tracker::PieceHolder],
-    ) -> Result<NodeId> {
+    /// Distribution priority:
+    /// 1. Peers holding exactly 1 piece (bring to ≥2 for repair eligibility).
+    /// 2. Peers holding 0 pieces (increase overall redundancy).
+    /// 3. Fallback: any alive peer.
+    fn select_distribution_target(&self, cid: &Cid) -> Result<NodeId> {
         use rand::seq::SliceRandom;
 
+        let holder_counts = self.tracker.holders_with_count(cid);
         let holder_ids: std::collections::HashSet<NodeId> =
-            holders.iter().map(|h| h.node_id).collect();
+            holder_counts.iter().map(|(id, _)| *id).collect();
 
-        // Get the set of alive peers from SWIM.
         let alive_peers = self.net.swim().alive_members();
 
-        // Prefer peers that don't already hold a piece.
-        let mut candidates: Vec<NodeId> = alive_peers
+        // Priority 1: peers holding exactly 1 piece (bring to ≥2).
+        let one_piece_peers: Vec<NodeId> = holder_counts
             .iter()
-            .copied()
-            .filter(|id| !holder_ids.contains(id))
+            .filter(|(id, count)| *count == 1 && alive_peers.contains(id) && *id != self.node_id)
+            .map(|(id, _)| *id)
             .collect();
 
-        if candidates.is_empty() {
-            // All alive peers already hold pieces — pick a random existing holder.
-            candidates = holder_ids.into_iter().collect();
+        if let Some(target) = one_piece_peers.choose(&mut rand::thread_rng()) {
+            return Ok(*target);
         }
 
-        candidates
+        // Priority 2: peers holding 0 pieces.
+        let zero_piece_peers: Vec<NodeId> = alive_peers
+            .iter()
+            .copied()
+            .filter(|id| !holder_ids.contains(id) && *id != self.node_id)
+            .collect();
+
+        if let Some(target) = zero_piece_peers.choose(&mut rand::thread_rng()) {
+            return Ok(*target);
+        }
+
+        // Fallback: any alive peer (excluding self).
+        let fallback: Vec<NodeId> = alive_peers
+            .into_iter()
+            .filter(|id| *id != self.node_id)
+            .collect();
+
+        fallback
             .choose(&mut rand::thread_rng())
             .copied()
             .ok_or_else(|| HealthError::RepairFailed {
@@ -333,5 +397,27 @@ mod tests {
             target: 5,
         };
         assert_eq!(req.severity(), "normal");
+    }
+
+    #[test]
+    fn repair_request_deficit() {
+        let req = RepairRequest::Normal {
+            cid: Cid::from_data(b"deficit"),
+            available: 50,
+            target: 96,
+        };
+        assert_eq!(req.target_count(), 96);
+        assert_eq!(req.available_count(), 50);
+    }
+
+    #[test]
+    fn critical_deficit() {
+        let req = RepairRequest::Critical {
+            cid: Cid::from_data(b"critical"),
+            available: 10,
+            k: 32,
+        };
+        assert_eq!(req.target_count(), 32);
+        assert_eq!(req.available_count(), 10);
     }
 }

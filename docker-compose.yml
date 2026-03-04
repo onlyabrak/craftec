@@ -25,7 +25,7 @@ services:
       CRAFTEC_DATA_DIR: /data
       CRAFTEC_LISTEN_PORT: "4433"
       CRAFTEC_BOOTSTRAP_PEERS: ""
-      CRAFTEC_HEALTH_SCAN_INTERVAL_SECS: "3600"
+      CRAFTEC_HEALTH_SCAN_CYCLE_SECS: "300"
       RUST_LOG: info,craftec=debug
     volumes:
       - node1-data:/data
@@ -45,7 +45,7 @@ services:
       CRAFTEC_DATA_DIR: /data
       CRAFTEC_LISTEN_PORT: "4433"
       CRAFTEC_BOOTSTRAP_PEERS: "172.28.1.1:4433"
-      CRAFTEC_HEALTH_SCAN_INTERVAL_SECS: "3600"
+      CRAFTEC_HEALTH_SCAN_CYCLE_SECS: "300"
       RUST_LOG: info,craftec=debug
     volumes:
       - node2-data:/data
@@ -65,7 +65,7 @@ services:
       CRAFTEC_DATA_DIR: /data
       CRAFTEC_LISTEN_PORT: "4433"
       CRAFTEC_BOOTSTRAP_PEERS: "172.28.1.1:4433"
-      CRAFTEC_HEALTH_SCAN_INTERVAL_SECS: "3600"
+      CRAFTEC_HEALTH_SCAN_CYCLE_SECS: "300"
       RUST_LOG: info,craftec=debug
     volumes:
       - node3-data:/data
@@ -85,7 +85,7 @@ services:
       CRAFTEC_DATA_DIR: /data
       CRAFTEC_LISTEN_PORT: "4433"
       CRAFTEC_BOOTSTRAP_PEERS: "172.28.1.1:4433"
-      CRAFTEC_HEALTH_SCAN_INTERVAL_SECS: "3600"
+      CRAFTEC_HEALTH_SCAN_CYCLE_SECS: "300"
       RUST_LOG: info,craftec=debug
     volumes:
       - node4-data:/data
@@ -105,7 +105,7 @@ services:
       CRAFTEC_DATA_DIR: /data
       CRAFTEC_LISTEN_PORT: "4433"
       CRAFTEC_BOOTSTRAP_PEERS: "172.28.1.1:4433"
-      CRAFTEC_HEALTH_SCAN_INTERVAL_SECS: "3600"
+      CRAFTEC_HEALTH_SCAN_CYCLE_SECS: "300"
       RUST_LOG: info,craftec=debug
     volumes:
       - node5-data:/data

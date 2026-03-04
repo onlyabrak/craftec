@@ -266,6 +266,24 @@
 
 ---
 
+## craftec-spec — Architecture Knowledge Graph CLI
+
+- [x] Phase 1: Project skeleton + schema types
+- [x] Phase 2: Schema validation (6 tests)
+- [x] Phase 3: Value compliance checker (4 tests)
+- [x] Phase 4: Multi-language tree-sitter extractors + knowledge graph (6 tests)
+- [x] Phase 5: Sync + report + init + gen-tests
+- [x] Phase 6: End-to-end against real codebase (100% coverage on health crate)
+
+### Notes
+- Location: `/Users/onlyabrak/dev/craftec/craftec-spec/`
+- 16 tests total, clippy clean
+- Extractors: Rust (tree-sitter-rust), TypeScript (tree-sitter-typescript), Python (tree-sitter-python)
+- All 7 CLI commands functional: init, validate, sync, check, graph, report, gen-tests
+- Real spec: `specs/health_repair.toml` — 27 code_map items, 100% forward/reverse coverage
+
+---
+
 ## QUIC-Native RPC via ALPN + Docker Lifecycle Tests
 
 - [x] Phase 1: RPC Wire Types — RpcRequest, RpcResponse, RpcValue enums + encode/decode in wire.rs

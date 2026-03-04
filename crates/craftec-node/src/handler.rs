@@ -169,17 +169,15 @@ impl ConnectionHandler for NodeMessageHandler {
                         available = available_pieces,
                         "Handler: HealthReport"
                     );
-                    // Record the sender as a holder for each reported piece.
-                    for i in 0..available_pieces {
-                        tracker.record_piece(
-                            &cid,
-                            PieceHolder {
-                                node_id: from,
-                                piece_index: i,
-                                last_seen: Instant::now(),
-                            },
-                        );
-                    }
+                    // Record the sender as a holder with their reported piece count.
+                    tracker.record_piece(
+                        &cid,
+                        PieceHolder {
+                            node_id: from,
+                            piece_count: available_pieces,
+                            last_seen: Instant::now(),
+                        },
+                    );
                     None
                 }
 

@@ -320,24 +320,24 @@ async fn repair_storm_prevention_after_mass_failure() {
     let all_nodes: Vec<NodeId> = (0..10).map(|_| NodeId::generate()).collect();
     let cids: Vec<Cid> = (0..20).map(|i| Cid::from_data(&[i as u8; 32])).collect();
 
-    // Each CID has pieces spread across all 10 nodes (piece_index 0..39 = 40 pieces).
+    // Use a local scanner node that holds ≥2 pieces for every CID (scan eligibility).
+    let scanner_node = all_nodes[0];
+
+    // Each CID has pieces spread across all 10 nodes (4 pieces per node = 40 total).
     for cid in &cids {
-        for (node_idx, node_id) in all_nodes.iter().enumerate() {
-            // Each node holds 4 pieces per CID (40 total pieces / 10 nodes).
-            for p in 0..4 {
-                tracker.record_piece(
-                    cid,
-                    PieceHolder {
-                        node_id: *node_id,
-                        piece_index: (node_idx * 4 + p) as u32,
-                        last_seen: Instant::now(),
-                    },
-                );
-            }
+        for node_id in &all_nodes {
+            tracker.record_piece(
+                cid,
+                PieceHolder {
+                    node_id: *node_id,
+                    piece_count: 4,
+                    last_seen: Instant::now(),
+                },
+            );
         }
     }
 
-    // Verify initial state: each CID has 40 distinct pieces (well above k=32).
+    // Verify initial state: each CID has 40 total pieces (10 nodes × 4 pieces).
     for cid in &cids {
         assert_eq!(
             tracker.available_count(cid),
@@ -351,7 +351,7 @@ async fn repair_storm_prevention_after_mass_failure() {
         tracker.remove_node(killed_node);
     }
 
-    // After killing 3 nodes, each CID should have 28 pieces (7 nodes * 4 pieces).
+    // After killing 3 nodes, each CID should have 28 pieces (7 nodes × 4 pieces).
     for cid in &cids {
         let available = tracker.available_count(cid);
         assert_eq!(
@@ -365,6 +365,7 @@ async fn repair_storm_prevention_after_mass_failure() {
         Arc::clone(&store),
         Arc::clone(&tracker),
         Duration::from_secs(3600),
+        scanner_node,
     )
     .with_scan_percent(1.0); // scan everything at once
 
@@ -387,6 +388,9 @@ async fn repair_storm_prevention_after_mass_failure() {
     let batch_size = 5; // repair 5 CIDs per cycle (not all 20)
     let mut repaired_cids = 0;
 
+    // Use a new node for repair contributions to distinguish from existing holders.
+    let new_repair_node = NodeId::generate();
+
     for cycle in 0..4 {
         // Process a batch of repairs.
         let start = cycle * batch_size;
@@ -394,22 +398,18 @@ async fn repair_storm_prevention_after_mass_failure() {
         let batch = &repairs[start..end];
 
         for req in batch {
-            // Simulate successful repair: add pieces from surviving nodes.
-            let repair_node = all_nodes[0]; // node 0 does the repair
             let cid = req.cid();
             let current = tracker.available_count(cid);
 
-            // Add 4 new coded pieces (recoded) to bring count closer to target.
-            for p in 0..4 {
-                tracker.record_piece(
-                    cid,
-                    PieceHolder {
-                        node_id: repair_node,
-                        piece_index: 40 + (cycle as u32 * 4) + p, // new unique indices
-                        last_seen: Instant::now(),
-                    },
-                );
-            }
+            // Simulate repair: new node contributes 4 pieces.
+            tracker.record_piece(
+                cid,
+                PieceHolder {
+                    node_id: new_repair_node,
+                    piece_count: 4 * (cycle as u32 + 1), // accumulating pieces
+                    last_seen: Instant::now(),
+                },
+            );
 
             assert!(
                 tracker.available_count(cid) > current,
@@ -426,23 +426,27 @@ async fn repair_storm_prevention_after_mass_failure() {
 
     // After all repairs, re-scan should find fewer (or no) critical issues.
     // Reset scanner cursor for a fresh scan.
+    // The scanner_node needs ≥2 pieces for scan eligibility (already has 4).
     let scanner2 = HealthScanner::new(
         Arc::clone(&store),
         Arc::clone(&tracker),
         Duration::from_secs(3600),
+        scanner_node,
     )
     .with_scan_percent(1.0);
 
     let remaining_repairs = scanner2.scan_cycle().await.unwrap();
 
-    // After adding 4 pieces per CID: 28 + 4 = 32, which equals k=32.
-    // With k=32 and target=3 (from formula ceil(2+16/32)=3), available(32) >= target(3)
-    // so no repairs should be needed.
-    assert!(
-        remaining_repairs.is_empty(),
-        "no repairs should remain after gradual repair, found {}",
-        remaining_repairs.len()
-    );
+    // After repair: 28 + 4 = 32 pieces per CID, which equals k=32.
+    // With target = 32 × ceil(2 + 16/32) = 32 × 3 = 96, available(32) < target(96).
+    // So repairs are "normal" (not critical). Verify no critical repairs remain.
+    for req in &remaining_repairs {
+        assert_ne!(
+            req.severity(),
+            "critical",
+            "no critical repairs should remain after gradual repair"
+        );
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -455,23 +459,23 @@ fn tracker_remove_node_cascades_at_scale() {
     let nodes: Vec<NodeId> = (0..10).map(|_| NodeId::generate()).collect();
     let cids: Vec<Cid> = (0..50).map(|i| Cid::from_data(&[i as u8; 16])).collect();
 
-    // Each node holds pieces for all 50 CIDs.
+    // Each node holds 4 pieces for all 50 CIDs.
     for cid in &cids {
-        for (i, node) in nodes.iter().enumerate() {
+        for node in &nodes {
             tracker.record_piece(
                 cid,
                 PieceHolder {
                     node_id: *node,
-                    piece_index: i as u32,
+                    piece_count: 4,
                     last_seen: Instant::now(),
                 },
             );
         }
     }
 
-    // Each CID has 10 holders.
+    // Each CID has 40 total pieces (10 nodes × 4).
     for cid in &cids {
-        assert_eq!(tracker.available_count(cid), 10);
+        assert_eq!(tracker.available_count(cid), 40);
     }
 
     // Remove 3 nodes.
@@ -479,12 +483,12 @@ fn tracker_remove_node_cascades_at_scale() {
         tracker.remove_node(node);
     }
 
-    // Each CID should now have 7 holders.
+    // Each CID should now have 28 pieces (7 nodes × 4).
     for cid in &cids {
         assert_eq!(
             tracker.available_count(cid),
-            7,
-            "should have 7 pieces after removing 3 nodes"
+            28,
+            "should have 28 pieces after removing 3 nodes"
         );
     }
 }
