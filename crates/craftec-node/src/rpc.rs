@@ -126,6 +126,13 @@ impl RpcHandler for NodeRpcHandler {
                     writer,
                     signature,
                 } => {
+                    // P1: Verify the writer is the local database owner (single-writer model).
+                    if writer != node_id {
+                        return RpcResponse::Error {
+                            code: 403,
+                            message: "not the database owner".into(),
+                        };
+                    }
                     if !verify(sql.as_bytes(), &signature, &writer) {
                         return RpcResponse::Error {
                             code: 403,
